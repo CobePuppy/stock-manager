@@ -3,6 +3,7 @@ import pandas as pd
 import time
 import config
 import predictor
+import database
 
 def process_and_save(period, sort_by, top_n=20, filename_prefix="排名"):
     print(f"\n[{period}] 正在处理...")
@@ -18,7 +19,7 @@ def process_and_save(period, sort_by, top_n=20, filename_prefix="排名"):
         if '日排行' in period and '增仓占比' not in df.columns:
              df['增仓占比'] = float('nan') # 标记缺失
              
-        ranked_df = rf.rank_fund_flow(df, sort_by=sort_by, top_n=top_n)
+        ranked_df = rf.rank_fund_flow(df, sort_by=sort_by, top_n=top_n, period=period)
         
         # 3. 输出展示 & 4. 保存本地 (结果)
         save_name = f"{filename_prefix}_{period}"
@@ -51,6 +52,12 @@ def process_and_save(period, sort_by, top_n=20, filename_prefix="排名"):
         print(f"[{period}] 未获取到数据")
 
 if __name__ == "__main__":
+    # 初始化数据库
+    try:
+        database.init_all_dbs()
+    except Exception as e:
+        print(f"数据库初始化警告: {e}")
+
     current_date = pd.Timestamp.now().strftime("%Y-%m-%d")
     print(f"开始执行资金流向分析 - {current_date}")
     

@@ -12,8 +12,8 @@ import database
 st.set_page_config(page_title="Stock Manager AI", page_icon="📈", layout="wide")
 
 # 初始化数据库
-if not os.path.exists(config.DB_PATH):
-    database.init_db()
+if not os.path.exists(config.DB_PATH) or not os.path.exists(config.HISTORY_DB_PATH):
+    database.init_all_dbs()
 
 def load_watchlist():
     return database.get_watchlist()
@@ -94,7 +94,10 @@ if selected_page == "🔍 智能选股":
     else:
         period = "即时" # 默认
 
-    st.subheader(f"📅 当前展示: {period} 数据")
+    # 计算显示日期
+    trade_date = database.get_stock_trade_date()
+    
+    st.subheader(f"📅 当前展示: {period} 数据 (数据日期: {trade_date})")
     
     refresh = st.button("🔄 刷新数据")
     
@@ -114,7 +117,8 @@ if selected_page == "🔍 智能选股":
                 if df is not None and not df.empty:
                     # 排名计算
                     sort_by = 'ratio' if '增仓占比' in df.columns else 'net'
-                    ranked_df = rf.rank_fund_flow(df, sort_by=sort_by, top_n=config.TOP_N)
+                    # 传入 period 参数以触发自动保存(如果是即时数据)
+                    ranked_df = rf.rank_fund_flow(df, sort_by=sort_by, top_n=config.TOP_N, period=period)
                     
                     # 格式化展示
                     display_df = ranked_df.copy()
@@ -189,7 +193,7 @@ elif selected_page == "🤖 AI 预测分析":
                 if st.button("获取此页面的即时 Top 数据"):
                      df = rf.get_fund_flow_data(period='即时')
                      if not df.empty:
-                        target_df = rf.rank_fund_flow(df, sort_by='ratio', top_n=config.PREDICT_TOP_N)
+                        target_df = rf.rank_fund_flow(df, sort_by='ratio', top_n=config.PREDICT_TOP_N, period='即时')
                         st.session_state['prediction_target'] = target_df
                         st.rerun()
             

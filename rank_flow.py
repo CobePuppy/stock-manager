@@ -316,12 +316,13 @@ def fetch_volume_ratio_for_list(df: pd.DataFrame) -> pd.DataFrame:
     df['当日量比'] = df['股票代码'].map(ratios_map)
     return df
 
-def rank_fund_flow(fund_flow_df: pd.DataFrame, sort_by: str = 'ratio', top_n: int = 50) -> pd.DataFrame:
+def rank_fund_flow(fund_flow_df: pd.DataFrame, sort_by: str = 'ratio', top_n: int = 50, period: str = None) -> pd.DataFrame:
     """
     对资金流入数据进行排名
     :param fund_flow_df: 包含资金流入数据的DataFrame
     :param sort_by: 排序指标，'ratio'表示增仓占比，'net'表示净流入(主力)
     :param top_n: 返回前N名
+    :param period: 周期名称(如'即时'), 如果提供且为'即时'，则会触发保存Top20到历史数据库
     :return: 排名后的DataFrame
     """
     if sort_by == 'ratio':
@@ -336,6 +337,20 @@ def rank_fund_flow(fund_flow_df: pd.DataFrame, sort_by: str = 'ratio', top_n: in
     if column_name and column_name in fund_flow_df.columns:
         # 兼容列名 '股票简称' (新API) 和 '股票名称' (旧代码可能期望)
         name_col = '股票简称' if '股票简称' in fund_flow_df.columns else '股票名称'
+        
+        # 保留未过滤的全量数据用于回测记录
+        original_df = fund_flow_df
+
+        # 0. 增加过滤逻辑: 在所有票中找出流通盘小于1000亿元的
+        # 流通市值单位通常是元
+        if '流通市值' in fund_flow_df.columns:
+            # 1000亿 = 1000 * 100000000 = 100,000,000,000
+            # 过滤掉 >= 1000亿 的
+            filtered_df = fund_flow_df[fund_flow_df['流通市值'] < 1000_0000_0000]
+            if filtered_df.empty:
+                print("警告: 过滤后数据为空，可能所有股票流通市值都超过阈值或者流通市值数据异常")
+            else:
+                fund_flow_df = filtered_df
         
         # 1. 先排序并取Top N
         ranked_df = fund_flow_df.sort_values(by=column_name, ascending=False).head(top_n).copy()
@@ -356,6 +371,36 @@ def rank_fund_flow(fund_flow_df: pd.DataFrame, sort_by: str = 'ratio', top_n: in
         # if '当日量比' in ranked_df.columns:
         #    result_cols.append('当日量比')
             
+        # 4. 触发保存历史 Top (仅当 period='即时' 且 排序为 ratio 时，或者是用户指定的主榜单)
+        # 通常我们只保存 '即时' 的 '增仓占比' 排名用于回测
+        if period == '即时' and sort_by == 'ratio':
+            try:
+                # A. 保存当日榜单前20到 daily_top_history
+                database.save_daily_top_list(ranked_df, period, top_n=20)
+                
+                # B. 触发回测数据更新:
+                # 获取所有曾入榜的股票代码
+                tracked_codes = database.get_all_tracked_stocks()
+                
+                if tracked_codes:
+                    print(f"正在更新 {len(tracked_codes)} 只历史入榜股票的当日数据...")
+                    
+                    # 筛选出 tracked_codes 对应的行
+                    # 需要先把 股票代码 转为 string 比较
+                    fund_flow_df_str = original_df.copy()
+                    if '股票代码' in fund_flow_df_str.columns:
+                        fund_flow_df_str['股票代码'] = fund_flow_df_str['股票代码'].astype(str)
+                    
+                    df_tracked = fund_flow_df_str[fund_flow_df_str['股票代码'].isin(tracked_codes)]
+                    
+                    if not df_tracked.empty:
+                        database.save_daily_data_for_backtest(df_tracked)
+                    else:
+                        print("Warning: 未在当前数据中找到任何已追踪股票的数据")
+                
+            except Exception as e:
+                print(f"Warning: 自动保存历史排名/回测数据失败: {e}")
+
         return ranked_df[result_cols]
     else:
         print(f"列名 {column_name} 不存在于数据中，可用列: {fund_flow_df.columns.tolist()}")

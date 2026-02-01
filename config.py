@@ -10,6 +10,9 @@ CACHE_DIR = 'stock_data_cache'
 # 数据库路径
 DB_PATH = 'stock_data.db'
 
+# 回测历史数据库路径
+HISTORY_DB_PATH = 'stock_history.db'
+
 # 分析结果保存目录
 RESULT_DIR = 'analysis_results'
 

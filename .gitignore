@@ -37,7 +37,7 @@ env/
 
 # Project specific
 analysis_results/
-stock_data.db
+*.db
 stock_data_cache/
 last_save_time.csv
 *.log

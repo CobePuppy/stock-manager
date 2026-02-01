@@ -4,6 +4,9 @@ import config
 from datetime import datetime, timedelta
 import os
 
+def get_history_connection():
+    return sqlite3.connect(config.HISTORY_DB_PATH)
+
 def get_connection():
     return sqlite3.connect(config.DB_PATH)
 
@@ -34,9 +37,149 @@ def init_db():
                     -- 其他列会自动添加，但最好只存关键列或允许动态列
                     PRIMARY KEY (stock_code, period_type, cache_date)
                 )''')
+
+    # Daily Top Stocks History table (NEW)
+    # 用于保存每天的前20名股票代码，用于后续回测
+    c.execute('''CREATE TABLE IF NOT EXISTS daily_top_history (
+                    record_date TEXT,
+                    stock_code TEXT,
+                    stock_name TEXT,
+                    rank INTEGER,
+                    period_type TEXT,
+                    saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (record_date, stock_code, period_type)
+                )''')
                 
     conn.commit()
     conn.close()
+    
+    # Init History DB
+    init_history_db()
+
+def init_all_dbs():
+    """初始化所有数据库"""
+    init_db()
+    # init_history_db is called within init_db, but we can be explicit if needed
+    # But currently init_db() calls it at the end.
+
+def init_history_db():
+    conn = get_history_connection()
+    c = conn.cursor()
+    # 历史每日明细数据 (Backtest Data)
+    # 记录每个曾入榜股票的每日数据
+    c.execute('''CREATE TABLE IF NOT EXISTS daily_stock_data (
+                    trade_date TEXT,
+                    stock_code TEXT,
+                    stock_name TEXT,
+                    close_price REAL,
+                    change_pct REAL,
+                    net_inflow REAL,
+                    ratio REAL,
+                    turnover REAL,
+                    market_cap REAL,
+                    PRIMARY KEY (trade_date, stock_code)
+                )''')
+    conn.commit()
+    conn.close()
+
+def get_all_tracked_stocks():
+    """获取所有在历史Top榜单中出现过的股票代码"""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT stock_code FROM daily_top_history")
+        codes = [row[0] for row in cursor.fetchall()]
+        return codes
+    except Exception as e:
+        print(f"获取历史Top股票列表失败: {e}")
+        return []
+    finally:
+        conn.close()
+
+def save_daily_data_for_backtest(df_filtered):
+    """保存筛选后的股票当日数据到历史回测数据库"""
+    if df_filtered.empty:
+        return
+
+    conn = get_history_connection()
+    trade_date = get_stock_trade_date()
+    
+    try:
+        data_to_save = []
+        for _, row in df_filtered.iterrows():
+            code = str(row['股票代码'])
+            # 兼容列名
+            name = row.get('股票简称', row.get('股票名称', ''))
+            price = row.get('最新价', 0)
+            change = row.get('涨跌幅', 0)
+            net = row.get('净额', 0)
+            ratio = row.get('增仓占比', 0)
+            turnover = row.get('成交额', 0)
+            mcap = row.get('流通市值', 0)
+            
+            data_to_save.append((trade_date, code, name, price, change, net, ratio, turnover, mcap))
+            
+        c = conn.cursor()
+        # 删除当天旧记录 (如果存在)
+        # 简单起见，我们使用 REPLACE 或者忽略删除特定ID (因为每天我们会全量更新一次Backtest Universe)
+        # 但考虑到我们可能分批更新，还是应该基于ID删除
+        # 为了高效，直接用 REPLACE INTO
+        
+        c.executemany('''INSERT OR REPLACE INTO daily_stock_data 
+                         (trade_date, stock_code, stock_name, close_price, change_pct, net_inflow, ratio, turnover, market_cap)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''', data_to_save)
+        
+        conn.commit()
+        print(f"[Backtest] 已保存 {len(data_to_save)} 只追踪股票的当日数据到 {config.HISTORY_DB_PATH}")
+        
+    except Exception as e:
+        print(f"保存回测数据失败: {e}")
+    finally:
+        conn.close()
+
+
+def save_daily_top_list(df: pd.DataFrame, period: str, top_n: int = 20):
+    """
+    保存每日排名前N的股票到历史表
+    """
+    if df.empty or '股票代码' not in df.columns:
+        return
+
+    # 只保存前 top_n
+    df_top = df.head(top_n).copy()
+    
+    trade_date = get_stock_trade_date()
+    
+    conn = get_connection()
+    try:
+        data_to_insert = []
+        rank_counter = 1
+        
+        for _, row in df_top.iterrows():
+            code = str(row['股票代码'])
+            # 兼容简称列名
+            name = row.get('股票简称', row.get('股票名称', ''))
+            
+            data_to_insert.append((trade_date, code, name, rank_counter, period))
+            rank_counter += 1
+            
+        # 使用 INSERT OR REPLACE 覆盖当天的记录
+        c = conn.cursor()
+        
+        # 为了覆盖整个榜单，可以先删除当天该类型的旧记录，再插入新记录
+        # 如果只用REPLACE，可能导致名次变动后旧名次残留（例如以前第20名变成了第21名，不在新列表里，REPLACE不会删除它）
+        c.execute("DELETE FROM daily_top_history WHERE record_date = ? AND period_type = ?", (trade_date, period))
+        
+        c.executemany('''INSERT INTO daily_top_history (record_date, stock_code, stock_name, rank, period_type) 
+                         VALUES (?, ?, ?, ?, ?)''', data_to_insert)
+        
+        conn.commit()
+        print(f"[{period}] 前 {top_n} 名股票已保存到历史库 (日期: {trade_date})")
+        
+    except Exception as e:
+        print(f"保存历史排名失败: {e}")
+    finally:
+        conn.close()
 
 def get_stock_trade_date():
     """获取有效的交易日期（如果是周末则返回上周五）"""
