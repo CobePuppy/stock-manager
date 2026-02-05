@@ -132,13 +132,52 @@ with st.sidebar:
 if selected_page == "🔍 智能选股":
     st.header("🔍 资金流向智能选股")
     
-    # K线快速查看
+    # K线快速查看 - 优化版
     with st.expander("📈 个股K线快速查看", expanded=False):
-        c_k1, c_k2 = st.columns([1, 3])
-        with c_k1:
+        col_k1, col_k2, col_k3 = st.columns([2, 2, 1])
+
+        with col_k1:
             kline_code = st.text_input("输入股票代码 (如 600519):", max_chars=6, key="kline_home")
+
+        with col_k2:
+            kline_name = st.text_input("或输入股票名称 (如 贵州茅台):", key="kline_name_home")
+
+        # 处理名称搜索
+        if kline_name and not kline_code:
+            # 尝试从当前数据中查找
+            df_current = st.session_state.get('df_即时') or st.session_state.get(f'df_{st.session_state.get("last_period", "即时")}')
+            if df_current is not None and not df_current.empty:
+                name_col = '股票简称' if '股票简称' in df_current.columns else '股票名称'
+                matched = df_current[df_current[name_col].str.contains(kline_name, na=False, case=False)]
+                if not matched.empty:
+                    kline_code = matched.iloc[0]['股票代码']
+                    st.info(f"找到股票: {matched.iloc[0][name_col]} ({kline_code})")
+                else:
+                    st.warning(f"未找到包含 '{kline_name}' 的股票")
+
+        # 最近查看历史
+        if 'kline_history' not in st.session_state:
+            st.session_state['kline_history'] = []
+
+        if kline_code and kline_code not in st.session_state['kline_history']:
+            st.session_state['kline_history'].insert(0, kline_code)
+            st.session_state['kline_history'] = st.session_state['kline_history'][:5]  # 只保留最近5个
+
+        # 显示历史记录
+        if st.session_state['kline_history']:
+            st.markdown("**最近查看:** " + " | ".join([f"`{code}`" for code in st.session_state['kline_history']]))
+
         if kline_code:
-            fetch_and_plot_kline(kline_code)
+            # 尝试获取股票名称
+            df_current = st.session_state.get('df_即时') or st.session_state.get(f'df_{st.session_state.get("last_period", "即时")}')
+            stock_name = None
+            if df_current is not None and not df_current.empty:
+                matched = df_current[df_current['股票代码'] == kline_code]
+                if not matched.empty:
+                    name_col = '股票简称' if '股票简称' in df_current.columns else '股票名称'
+                    stock_name = matched.iloc[0][name_col]
+
+            fetch_and_plot_kline(kline_code, stock_name)
 
     # 获取当前时间用于展示数据更新状态
     current_time_str = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -147,6 +186,7 @@ if selected_page == "🔍 智能选股":
     with st.expander("📊 查看计算公式说明", expanded=False):
         st.markdown("""
         - **增仓占比**: `(净流入额 / 总成交额) * 100%`
+        - **当日量比**: `今日成交量 / 过去5日平均每日成交量` (大于1表示放量)
         """)
     
     col1, col2, col3 = st.columns(3)
@@ -192,8 +232,8 @@ if selected_page == "🔍 智能选股":
                 df = st.session_state.get(f'df_{period}')
 
                 if df is not None and not df.empty:
-                    # 排名计算
-                    sort_by = 'ratio' if '增仓占比' in df.columns else 'net'
+                    # 排名计算 - 优先使用综合评分（增仓+放量）
+                    sort_by = 'comprehensive' if '增仓占比' in df.columns else 'net'
                     # 传入 period 参数以触发自动保存(如果是即时数据)
                     ranked_df = rf.rank_fund_flow(df, sort_by=sort_by, top_n=config.TOP_N, period=period)
                     
@@ -231,20 +271,40 @@ if selected_page == "🔍 智能选股":
                     )
                     
                     # 快捷操作区
-                    st.markdown("### 🛠️ 批量操作")
-                    
-                    # 批量加入自选
+                    st.markdown("### 🛠️ 快捷操作")
+
                     # 构造选项列表: "600355 ST精伦"
-                    display_df['label'] = display_df['股票代码'] + " " + display_df['股票简称']
-                    to_add_labels = st.multiselect("选择加入自选的股票", display_df['label'].tolist())
-                    
-                    if st.button("加入自选"):
-                        current_wl = load_watchlist()
-                        # 从label还原出代码
-                        to_add_codes = [label.split(" ")[0] for label in to_add_labels]
-                        updated_wl = list(set(current_wl + to_add_codes))
-                        save_watchlist(updated_wl)
-                        st.success(f"已添加 {len(to_add_codes)} 只股票到自选")
+                    name_col = '股票简称' if '股票简称' in ranked_df.columns else '股票名称'
+                    ranked_df['label'] = ranked_df['股票代码'].astype(str) + " " + ranked_df[name_col].astype(str)
+
+                    col_op1, col_op2 = st.columns(2)
+
+                    with col_op1:
+                        st.markdown("**📈 查看K线图**")
+                        kline_select = st.selectbox(
+                            "选择股票查看K线",
+                            options=["请选择..."] + ranked_df['label'].tolist(),
+                            key="kline_select_main"
+                        )
+                        if kline_select != "请选择...":
+                            selected_code = kline_select.split(" ")[0]
+                            selected_name = " ".join(kline_select.split(" ")[1:])
+                            with st.expander(f"📊 {selected_name} ({selected_code}) K线图", expanded=True):
+                                fetch_and_plot_kline(selected_code, selected_name)
+
+                    with col_op2:
+                        st.markdown("**⭐ 批量加入自选**")
+                        to_add_labels = st.multiselect("选择股票", ranked_df['label'].tolist(), key="add_watchlist")
+                        if st.button("加入自选", use_container_width=True):
+                            if to_add_labels:
+                                current_wl = load_watchlist()
+                                # 从label还原出代码
+                                to_add_codes = [label.split(" ")[0] for label in to_add_labels]
+                                updated_wl = list(set(current_wl + to_add_codes))
+                                save_watchlist(updated_wl)
+                                st.success(f"✅ 已添加 {len(to_add_codes)} 只股票到自选")
+                            else:
+                                st.warning("请先选择股票")
                 else:
                     st.error("未能获取数据，请检查网络或稍后重试")
             except Exception as e:
@@ -270,7 +330,7 @@ elif selected_page == "🤖 AI 预测分析":
                 if st.button("获取此页面的即时 Top 数据"):
                      df = rf.get_fund_flow_data(period='即时')
                      if not df.empty:
-                        target_df = rf.rank_fund_flow(df, sort_by='ratio', top_n=config.PREDICT_TOP_N, period='即时')
+                        target_df = rf.rank_fund_flow(df, sort_by='comprehensive', top_n=config.PREDICT_TOP_N, period='即时')
                         st.session_state['prediction_target'] = target_df
                         st.rerun()
             
@@ -290,41 +350,102 @@ elif selected_page == "🤖 AI 预测分析":
                     column_config={
                         "股票代码": st.column_config.TextColumn("代码"),
                         "增仓占比": st.column_config.NumberColumn("增仓占比", format="%.2f%%"),
+                        "当日量比": st.column_config.NumberColumn("当日量比", format="%.2f", help="今日成交量 / 过去5日均量"),
                         "换手率": st.column_config.NumberColumn("换手率", format="%.2f%%"),
                         "涨跌幅": st.column_config.NumberColumn("涨跌幅", format="%.2f%%"),
                     }
                 )
 
+                # 添加K线快速查看
+                st.markdown("**📈 快速查看K线**")
+                name_col = '股票简称' if '股票简称' in target_df.columns else '股票名称'
+                stock_options = ["请选择..."] + (target_df['股票代码'].astype(str) + " " + target_df[name_col].astype(str)).tolist()
+                kline_choice = st.selectbox("选择股票", stock_options, key="kline_predict")
+                if kline_choice != "请选择...":
+                    sel_code = kline_choice.split(" ")[0]
+                    sel_name = " ".join(kline_choice.split(" ")[1:])
+                    with st.expander(f"📊 {sel_name} ({sel_code}) K线图", expanded=True):
+                        fetch_and_plot_kline(sel_code, sel_name)
+
+                st.markdown("---")
                 if st.button("🚀 开始 AI 分析"):
                     progress_bar = st.progress(0)
                     status_text = st.empty()
-                    
+
                     results = []
                     predictor_instance = predictor.StockPredictor()
-                    
+
                     total = len(target_df)
                     for i, (index, row) in enumerate(target_df.iterrows()):
                         code = row['股票代码']
                         name = row['股票简称']
-                        status_text.text(f"正在分析 ({i+1}/{total}): {name} {code} ...")
-                        
-                        # 补充基本面和新闻 (需确保 predictor 有这些方法，若上一步已更新则可直接用)
-                        # 这里我们直接调用 predict，它内部会去 fetch 那些数据
+                        status_text.text(f"正在深度分析 ({i+1}/{total}): {name} {code} ...")
+
+                        # 调用AI进行深度分析
                         pred = predictor_instance.predict(code, name, row)
-                        
+
                         res_row = {
                             "股票代码": code,
                             "股票简称": name,
+                            "综合评分": pred.get("comprehensive_score", "分析失败"),
                             "推荐买入": pred.get("buy", "分析失败"),
                             "推荐卖出": pred.get("sell", "分析失败"),
-                            "时间节点": pred.get("time", "分析失败")
+                            "建议仓位": pred.get("position", "分析失败"),
+                            "时间节点": pred.get("time", "分析失败"),
+                            "技术面分析": pred.get("technical_analysis", ""),
+                            "资金面分析": pred.get("fund_analysis", ""),
+                            "买入理由": pred.get("buy_reason", ""),
+                            "卖出策略": pred.get("sell_reason", ""),
+                            "风险提示": pred.get("risk", "")
                         }
                         results.append(res_row)
                         progress_bar.progress((i + 1) / total)
-                    
-                    status_text.text("分析完成！")
+
+                    status_text.text("✅ 分析完成！")
                     res_df = pd.DataFrame(results)
-                    st.table(res_df)
+
+                    # 保存到session_state供下载和查看
+                    st.session_state['prediction_results'] = res_df
+
+                    # 分标签页展示简要和详细信息
+                    result_tab1, result_tab2 = st.tabs(["📊 简要概览", "📝 详细分析"])
+
+                    with result_tab1:
+                        st.markdown("### 📊 AI 分析概览")
+                        summary_df = res_df[["股票代码", "股票简称", "综合评分", "推荐买入", "推荐卖出", "建议仓位"]].copy()
+                        st.dataframe(summary_df, use_container_width=True)
+
+                    with result_tab2:
+                        st.markdown("### 📝 详细分析报告")
+                        for idx, row in res_df.iterrows():
+                            with st.expander(f"**{row['股票简称']} ({row['股票代码']})** - 综合评分: {row['综合评分']}", expanded=(idx == 0)):
+                                col_a, col_b = st.columns(2)
+
+                                with col_a:
+                                    st.markdown(f"**🎯 操作建议**")
+                                    st.info(f"**买入**: {row['推荐买入']}\n\n**卖出**: {row['推荐卖出']}\n\n**仓位**: {row['建议仓位']}")
+
+                                with col_b:
+                                    st.markdown(f"**⏰ 时间节点**")
+                                    st.success(row['时间节点'])
+
+                                st.markdown("**📈 技术面分析**")
+                                st.write(row['技术面分析'])
+
+                                st.markdown("**💰 资金面分析**")
+                                st.write(row['资金面分析'])
+
+                                col_c, col_d = st.columns(2)
+                                with col_c:
+                                    st.markdown("**✅ 买入理由**")
+                                    st.write(row['买入理由'])
+
+                                with col_d:
+                                    st.markdown("**📤 卖出策略**")
+                                    st.write(row['卖出策略'])
+
+                                st.markdown("**⚠️ 风险提示**")
+                                st.warning(row['风险提示'])
                     
                     # 下载
                     csv = res_df.to_csv(index=False).encode('utf-8-sig')
@@ -332,12 +453,46 @@ elif selected_page == "🤖 AI 预测分析":
         
         with tab2:
             st.markdown("### 🎯 单股深度诊断")
-            
-            c1, c2 = st.columns([1, 3])
-            with c1:
-                code_input = st.text_input("输入股票代码 (如 000001):", max_chars=6)
-                name_input = st.text_input("输入股票名称 (可选):")
-            
+
+            # 提供多种输入方式
+            input_mode = st.radio("选择输入方式", ["手动输入", "从排名列表选择"], horizontal=True, key="input_mode")
+
+            code_input = None
+            name_input = None
+
+            if input_mode == "手动输入":
+                c1, c2, c3 = st.columns([2, 2, 1])
+                with c1:
+                    code_input = st.text_input("输入股票代码 (如 000001):", max_chars=6, key="manual_code")
+                with c2:
+                    name_input_search = st.text_input("或输入股票名称:", key="manual_name")
+                    if name_input_search and not code_input:
+                        # 尝试从缓存数据中搜索
+                        df_search = st.session_state.get('df_即时') or st.session_state.get('prediction_target')
+                        if df_search is not None and not df_search.empty:
+                            name_col = '股票简称' if '股票简称' in df_search.columns else '股票名称'
+                            matched = df_search[df_search[name_col].str.contains(name_input_search, na=False, case=False)]
+                            if not matched.empty:
+                                code_input = matched.iloc[0]['股票代码']
+                                name_input = matched.iloc[0][name_col]
+                                st.success(f"✓ 找到: {name_input} ({code_input})")
+                            else:
+                                st.warning(f"未找到包含 '{name_input_search}' 的股票")
+            else:
+                # 从排名列表选择
+                df_select = st.session_state.get('df_即时') or st.session_state.get('prediction_target')
+                if df_select is not None and not df_select.empty:
+                    name_col = '股票简称' if '股票简称' in df_select.columns else '股票名称'
+                    # 取前30个
+                    top_df = df_select.head(30)
+                    options = ["请选择..."] + (top_df['股票代码'].astype(str) + " " + top_df[name_col].astype(str)).tolist()
+                    selected = st.selectbox("从Top30中选择", options, key="select_from_list")
+                    if selected != "请选择...":
+                        code_input = selected.split(" ")[0]
+                        name_input = " ".join(selected.split(" ")[1:])
+                else:
+                    st.info("💡 请先在 '智能选股' 页面获取数据")
+
             if code_input:
                 # 绘制K线图
                 st.markdown("---")
@@ -388,53 +543,89 @@ elif selected_page == "🤖 AI 预测分析":
                         predictor_instance = predictor.StockPredictor()
                         pred = predictor_instance.predict(code_input, name_input or code_input, found_row)
                         
-                        st.markdown("### 📊 AI 诊断报告")
-                        
+                        st.markdown("### 📊 AI 深度诊断报告")
+
                         if "error" in pred:
                             st.error(f"❌ 分析出错: {pred['error']}")
                         elif "text" in pred and "buy" not in pred:
                             st.info("💡 AI 给出的原始建议:")
                             st.markdown(pred["text"])
                         else:
-                            # 提取数据
-                            buy_price = pred.get("buy", "N/A")
-                            sell_price = pred.get("sell", "N/A")
-                            time_point = pred.get("time", "N/A")
-                            
-                            # 渲染美观的卡片
+                            # 渲染美观的卡片样式
                             st.markdown("""
                             <style>
-                            .trade-card {
-                                background-color: #f8f9fa;
-                                border: 1px solid #e9ecef;
-                                border-radius: 8px;
-                                padding: 20px;
-                                margin-top: 10px;
-                                border-left: 5px solid #4CAF50;
+                            .score-badge {
+                                font-size: 32px;
+                                font-weight: bold;
+                                color: #1976d2;
+                                text-align: center;
+                                padding: 10px;
+                                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                                -webkit-background-clip: text;
+                                -webkit-text-fill-color: transparent;
                             }
                             .price-label { font-size: 14px; color: #666; font-weight: 500;}
-                            .buy-price { font-size: 24px; color: #d32f2f; font-weight: bold; } /* 红色买入 (中国习惯) */
-                            .sell-price { font-size: 24px; color: #388e3c; font-weight: bold; } /* 绿色卖出 */
-                            .time-block { 
-                                margin-top: 20px; 
-                                background-color: #e3f2fd; 
-                                padding: 10px; 
-                                border-radius: 5px; 
-                                border-left: 3px solid #2196f3;
-                            }
+                            .buy-price { font-size: 24px; color: #d32f2f; font-weight: bold; }
+                            .sell-price { font-size: 24px; color: #388e3c; font-weight: bold; }
                             </style>
                             """, unsafe_allow_html=True)
-                            
-                            # 使用 HTML 展示主要指标
-                            c1, c2 = st.columns(2)
-                            with c1:
-                                st.markdown(f"<div><span class='price-label'>🔴 建议低价入场</span><br><span class='buy-price'>{buy_price}</span></div>", unsafe_allow_html=True)
-                            with c2:
-                                st.markdown(f"<div><span class='price-label'>🟢 建议高抛区间</span><br><span class='sell-price'>{sell_price}</span></div>", unsafe_allow_html=True)
-                            
+
+                            # 顶部核心信息卡片
+                            st.markdown("#### 🎯 核心建议")
+                            col_top1, col_top2, col_top3 = st.columns(3)
+
+                            with col_top1:
+                                score = pred.get("comprehensive_score", "N/A")
+                                st.markdown(f"**综合评分**")
+                                st.markdown(f"<div class='score-badge'>{score}</div>", unsafe_allow_html=True)
+
+                            with col_top2:
+                                st.markdown(f"**建议仓位**")
+                                position = pred.get("position", "N/A")
+                                if "重仓" in position:
+                                    st.success(f"### {position}")
+                                elif "半仓" in position:
+                                    st.info(f"### {position}")
+                                elif "轻仓" in position:
+                                    st.warning(f"### {position}")
+                                else:
+                                    st.error(f"### {position}")
+
+                            with col_top3:
+                                st.markdown(f"**操作建议**")
+                                buy_price = pred.get("buy", "N/A")
+                                if "观望" in buy_price:
+                                    st.error("### 🚫 观望")
+                                else:
+                                    st.success("### ✅ 可买入")
+
                             st.markdown("---")
-                            st.markdown(f"**⏰ 关键变盘/操作节点:**")
-                            st.info(time_point, icon="🕒")
+
+                            # 买卖价格区间
+                            col_price1, col_price2 = st.columns(2)
+                            with col_price1:
+                                st.markdown(f"<div><span class='price-label'>🔴 建议买入价</span><br><span class='buy-price'>{buy_price}</span></div>", unsafe_allow_html=True)
+                                st.caption(pred.get("buy_reason", ""))
+
+                            with col_price2:
+                                sell_price = pred.get("sell", "N/A")
+                                st.markdown(f"<div><span class='price-label'>🟢 建议卖出价</span><br><span class='sell-price'>{sell_price}</span></div>", unsafe_allow_html=True)
+                                st.caption(pred.get("sell_reason", ""))
+
+                            st.markdown("---")
+
+                            # 详细分析
+                            st.markdown("#### 📈 技术面分析")
+                            st.write(pred.get("technical_analysis", "暂无"))
+
+                            st.markdown("#### 💰 资金面分析")
+                            st.write(pred.get("fund_analysis", "暂无"))
+
+                            st.markdown("#### ⏰ 时间节点与变盘分析")
+                            st.info(pred.get("time", "暂无"), icon="🕒")
+
+                            st.markdown("#### ⚠️ 风险提示")
+                            st.warning(pred.get("risk", "暂无"))
                 else:
                     st.warning("请输入代码")
 

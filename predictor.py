@@ -182,10 +182,10 @@ def run_predictions(df_ranked, top_n=3):
     """
     if not config.ENABLE_PREDICTION:
         return None
-        
+
     predictor = StockPredictor()
     results = []
-    
+
     print(f"\n>>> 开始智能预测 (Top {top_n}) ...")
     if not predictor.api_key or "sk-xxxx" in predictor.api_key:
         print("提示: 请在 config.py 中配置 LLM_API_KEY 以启用预测功能。")
@@ -196,24 +196,31 @@ def run_predictions(df_ranked, top_n=3):
         code = row['股票代码']
         name = row['股票简称']
         print(f"正在分析: {name} ({code})...")
-        
+
         pred = predictor.predict(code, name, row)
-        
+
         # 结果处理
         if "error" in pred:
             print(f"  预测失败: {pred['error']}")
         else:
-            # 扁平化结果以便保存
+            # 扁平化结果以便保存（新增更多字段）
             res_row = {
                 "股票代码": code,
                 "股票简称": name,
+                "综合评分": pred.get("comprehensive_score", "-"),
                 "推荐买入": pred.get("buy", pred.get("text", "")),
                 "推荐卖出": pred.get("sell", ""),
-                "时间节点": pred.get("time", "")
+                "建议仓位": pred.get("position", "-"),
+                "时间节点": pred.get("time", ""),
+                "技术面分析": pred.get("technical_analysis", ""),
+                "资金面分析": pred.get("fund_analysis", ""),
+                "买入理由": pred.get("buy_reason", ""),
+                "卖出策略": pred.get("sell_reason", ""),
+                "风险提示": pred.get("risk", "")
             }
             results.append(res_row)
-            print(f"  买入: {res_row['推荐买入']} | 卖出: {res_row['推荐卖出']}")
-            
+            print(f"  综合评分: {res_row['综合评分']} | 买入: {res_row['推荐买入']} | 仓位: {res_row['建议仓位']}")
+
         time.sleep(1) # 避免触发API速率限制
 
     if results:

@@ -17,6 +17,10 @@ from datetime import datetime, timedelta
 import time
 import sys
 import database # Import database module
+import random
+
+# 全局缓存，避免重复请求同一只股票的量比数据
+_VOLUME_RATIO_CACHE = {}
 
 def convert_unit(x):
     if pd.isna(x):
@@ -224,108 +228,245 @@ def get_fund_flow_data(period: str = '即时') -> pd.DataFrame:
 
 import concurrent.futures
 
-def fetch_calculated_daily_volume_ratio(code):
-    try:
-        # 2. 获取历史数据 (作为主要数据源和fallback)
-        # 调整时间窗口，确保获取足够数据
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=60) # 扩大范围防止假期
-        start_date_str = start_date.strftime("%Y%m%d")
-        
-        hist_df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date_str, adjust="qfq")
-        if hist_df.empty or '成交量' not in hist_df.columns:
-            return code, np.nan
-            
-        # 按日期降序
-        hist_df = hist_df.sort_values(by="日期", ascending=False)
-        
-        # 3. 尝试获取实时数据 (当日成交量)
-        today_vol = None
-        is_spot_data = False
-        
-        try:
-            bid_df = ak.stock_bid_ask_em(symbol=code)
-            vol_row = bid_df[bid_df['item'] == '成交量']
-            if not vol_row.empty:
-                today_vol = float(vol_row['value'].values[0])
-                is_spot_data = True
-        except Exception:
-            # 如果获取实时数据失败（如网络限制），后续使用历史最新作为当日
-            pass
-            
-        # 4. 确定 当日量 和 历史均量 的取值范围
-        today_date_str = end_date.strftime("%Y-%m-%d")
-        
-        target_vol = 0.0
-        past_df = pd.DataFrame()
-        
-        if is_spot_data and today_vol is not None:
-            target_vol = today_vol
-            # 如果历史数据的最新一条也是今天，则计算均值时需要跳过它
-            if not hist_df.empty and hist_df.iloc[0]['日期'] == today_date_str:
-                past_df = hist_df.iloc[1:8]
-            else:
-                past_df = hist_df.head(7)
+def calculate_volume_quality_score(row):
+    """
+    计算放量质量评分 (0-100分)
+    综合考虑: 量比、成交额、换手率、流通市值
+    """
+    score = 0
+
+    # 1. 量比评分 (最高40分)
+    volume_ratio = row.get('当日量比', 0)
+    if pd.notna(volume_ratio) and volume_ratio > 0:
+        if volume_ratio >= 5:
+            score += 40  # 巨量
+        elif volume_ratio >= 3:
+            score += 35  # 强放量
+        elif volume_ratio >= 2:
+            score += 25  # 明显放量
+        elif volume_ratio >= 1.5:
+            score += 15  # 温和放量
         else:
-            # Fallback: 使用历史数据的最新一天作为 "当日"
-            # (适用于盘后分析或实时接口受限时)
-            if not hist_df.empty:
-                target_vol = hist_df.iloc[0]['成交量']
-                past_df = hist_df.iloc[1:8] # 过去7日不包含最新这一天
-            else:
-                return code, np.nan
-        
-        if past_df.empty or len(past_df) < 1:
-             return code, np.nan
-             
-        avg_vol = past_df['成交量'].mean()
-        
-        if avg_vol == 0:
-            return code, 0.0
-            
-        ratio = target_vol / avg_vol
-        return code, round(ratio, 2)
-        
-    except Exception:
-        return code, np.nan
+            score += 5   # 量比偏低
+
+    # 2. 成交额评分 (最高30分)
+    # 成交额越大，越能证明放量的有效性
+    turnover = row.get('成交额', 0)
+    if pd.notna(turnover) and turnover > 0:
+        if turnover >= 10_0000_0000:  # >= 10亿
+            score += 30
+        elif turnover >= 5_0000_0000:  # >= 5亿
+            score += 25
+        elif turnover >= 2_0000_0000:  # >= 2亿
+            score += 20
+        elif turnover >= 1_0000_0000:  # >= 1亿
+            score += 15
+        elif turnover >= 5000_0000:    # >= 5000万
+            score += 10
+        else:
+            score += 5  # 成交额偏小，放量可信度低
+
+    # 3. 换手率评分 (最高20分)
+    # 合理的换手率范围: 3%-15%，过高或过低都减分
+    turnover_rate = row.get('换手率', 0)
+    if pd.notna(turnover_rate):
+        # 如果是字符串格式，需要处理
+        if isinstance(turnover_rate, str):
+            turnover_rate = float(turnover_rate.replace('%', ''))
+
+        if 3 <= turnover_rate <= 15:
+            score += 20  # 理想换手率
+        elif 2 <= turnover_rate < 3 or 15 < turnover_rate <= 20:
+            score += 15  # 可接受范围
+        elif 1 <= turnover_rate < 2 or 20 < turnover_rate <= 30:
+            score += 10  # 偏离理想范围
+        else:
+            score += 5   # 过高或过低
+
+    # 4. 流通市值评分 (最高10分)
+    # 中等市值的放量更可信，过小容易操纵，过大不容易放量
+    market_cap = row.get('流通市值', 0)
+    if pd.notna(market_cap) and market_cap > 0:
+        if 50_0000_0000 <= market_cap <= 500_0000_0000:  # 50亿-500亿
+            score += 10  # 理想市值范围
+        elif 20_0000_0000 <= market_cap < 50_0000_0000 or 500_0000_0000 < market_cap <= 800_0000_0000:
+            score += 7   # 可接受范围
+        else:
+            score += 4   # 过小或过大
+
+    return min(score, 100)  # 确保不超过100分
+
+def calculate_position_increase_score(position_ratio):
+    """
+    计算增仓评分 (0-100分)
+    根据增仓占比计算分数
+    """
+    if pd.isna(position_ratio):
+        return 0
+
+    ratio = float(position_ratio)
+
+    if ratio >= 20:
+        return 100
+    elif ratio >= 15:
+        return 95
+    elif ratio >= 12:
+        return 90
+    elif ratio >= 10:
+        return 85
+    elif ratio >= 8:
+        return 75
+    elif ratio >= 6:
+        return 65
+    elif ratio >= 5:
+        return 55
+    elif ratio >= 4:
+        return 48
+    elif ratio >= 3:
+        return 40
+    elif ratio >= 2:
+        return 32
+    elif ratio >= 1:
+        return 25
+    elif ratio >= 0:
+        return 15
+    else:
+        # 负增仓（资金流出），按比例递减
+        return max(0, 15 + ratio * 2)  # 每-1%扣2分
+
+def calculate_comprehensive_score(row):
+    """
+    计算综合评分 (0-100分)
+    综合考虑增仓占比(60%)和放量质量(40%)
+
+    设计理念:
+    - 增仓占比：主要指标，反映资金流入强度
+    - 放量评分：辅助指标，验证放量真实性
+    - 只有两者都好，才能得高分
+    """
+    # 获取增仓评分
+    position_ratio = row.get('增仓占比', 0)
+    position_score = calculate_position_increase_score(position_ratio)
+
+    # 获取放量评分
+    volume_score = row.get('放量评分', 0)
+
+    # 综合评分：增仓60% + 放量40%
+    comprehensive = position_score * 0.6 + volume_score * 0.4
+
+    return round(comprehensive, 1)
+
+def classify_volume_level(volume_ratio):
+    """
+    根据量比值分类放量等级
+    """
+    if pd.isna(volume_ratio) or volume_ratio <= 0:
+        return "数据缺失"
+    elif volume_ratio < 0.8:
+        return "萎缩"
+    elif volume_ratio < 1.2:
+        return "正常"
+    elif volume_ratio < 1.8:
+        return "温和放量"
+    elif volume_ratio < 2.5:
+        return "明显放量"
+    elif volume_ratio < 5:
+        return "强放量"
+    else:
+        return "巨量"
 
 def fetch_volume_ratio_for_list(df: pd.DataFrame) -> pd.DataFrame:
     """
-    为给定的股票列表计算 '当日量比' (当日成交量/过去7日平均每日成交量)
+    为给定的股票列表获取 '当日量比' 数据，并进行智能分析
+    优化:
+    1. 批量获取全市场实时行情
+    2. 添加放量等级分类
+    3. 计算放量质量评分
+    4. 提供放量有效性判断
     """
     if df.empty or '股票代码' not in df.columns:
         return df
 
-    print(f"正在计算前 {len(df)} 名的当日量比数据 (并发请求)...")
-    
-    codes = df['股票代码'].tolist()
-    ratios_map = {}
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        future_to_code = {executor.submit(fetch_calculated_daily_volume_ratio, code): code for code in codes}
-        
-        for future in concurrent.futures.as_completed(future_to_code):
-            code = future_to_code[future]
-            try:
-                c, val = future.result()
-                ratios_map[c] = val
-            except Exception:
-                ratios_map[code] = np.nan
-            
-    # 映射回 DataFrame
-    df['当日量比'] = df['股票代码'].map(ratios_map)
-    return df
+    print(f"正在批量获取量比数据并进行智能分析...")
 
-def rank_fund_flow(fund_flow_df: pd.DataFrame, sort_by: str = 'ratio', top_n: int = 50, period: str = None) -> pd.DataFrame:
+    try:
+        # 获取全市场实时行情，包含 '代码' 和 '量比' 列
+        spot_df = ak.stock_zh_a_spot_em()
+
+        if spot_df.empty or '量比' not in spot_df.columns:
+            print("警告: 无法获取实时量比数据 (API返回为空或无量比列)")
+            df['当日量比'] = np.nan
+            df['放量等级'] = "数据缺失"
+            df['放量评分'] = 0
+            return df
+
+        # 建立 代码 -> 量比 的映射
+        spot_df['代码'] = spot_df['代码'].astype(str)
+        spot_df['量比'] = pd.to_numeric(spot_df['量比'], errors='coerce')
+
+        ratio_map = spot_df.set_index('代码')['量比'].to_dict()
+
+        # 映射量比到结果
+        df['当日量比'] = df['股票代码'].map(ratio_map)
+
+        # 添加放量等级分类
+        df['放量等级'] = df['当日量比'].apply(classify_volume_level)
+
+        # 计算放量质量评分
+        df['放量评分'] = df.apply(calculate_volume_quality_score, axis=1)
+
+        # 计算综合评分（需要在有增仓占比的情况下）
+        if '增仓占比' in df.columns:
+            df['综合评分'] = df.apply(calculate_comprehensive_score, axis=1)
+        else:
+            df['综合评分'] = df['放量评分']  # 如果没有增仓占比，只用放量评分
+
+        # 统计放量情况
+        volume_stats = df['放量等级'].value_counts()
+        print(f"量比分析完成:")
+        for level, count in volume_stats.items():
+            print(f"  {level}: {count}只")
+
+        # 统计高质量放量股票数量（评分>=70）
+        high_quality_count = len(df[df['放量评分'] >= 70])
+        if high_quality_count > 0:
+            print(f"  高质量放量(评分≥70): {high_quality_count}只")
+
+        # 统计综合评分优秀的股票数量（评分>=80）
+        if '综合评分' in df.columns:
+            excellent_count = len(df[df['综合评分'] >= 80])
+            if excellent_count > 0:
+                print(f"  综合评分优秀(≥80): {excellent_count}只 ⭐")
+
+        return df
+
+    except Exception as e:
+        print(f"批量获取量比数据失败 (可能是API连接限制): {e}")
+        # 失败时不中断流程，仅返回空值的量比列
+        df['当日量比'] = np.nan
+        df['放量等级'] = "数据缺失"
+        df['放量评分'] = 0
+        return df
+
+def rank_fund_flow(fund_flow_df: pd.DataFrame, sort_by: str = 'comprehensive', top_n: int = 50, period: str = None) -> pd.DataFrame:
     """
     对资金流入数据进行排名
     :param fund_flow_df: 包含资金流入数据的DataFrame
-    :param sort_by: 排序指标，'ratio'表示增仓占比，'net'表示净流入(主力)
+    :param sort_by: 排序指标
+                    'comprehensive'(默认): 综合评分 (增仓+放量)
+                    'ratio': 增仓占比
+                    'net': 净流入(主力)
     :param top_n: 返回前N名
     :param period: 周期名称(如'即时'), 如果提供且为'即时'，则会触发保存Top20到历史数据库
     :return: 排名后的DataFrame
     """
-    if sort_by == 'ratio':
+    # 先为所有数据获取量比和计算综合评分（在过滤和排序之前）
+    # 这样综合评分排序才有意义
+    fund_flow_df_with_volume = fetch_volume_ratio_for_list(fund_flow_df.copy())
+
+    if sort_by == 'comprehensive':
+        column_name = '综合评分'
+    elif sort_by == 'ratio':
         column_name = '增仓占比'
     elif sort_by == 'net':
         column_name = '净额'
@@ -333,47 +474,60 @@ def rank_fund_flow(fund_flow_df: pd.DataFrame, sort_by: str = 'ratio', top_n: in
         # 尝试兼容以前的参数
         column_names = {'large': '大单净流入', 'medium': '中单净流入', 'small': '小单净流入'}
         column_name = column_names.get(sort_by)
-    
-    if column_name and column_name in fund_flow_df.columns:
+
+    if column_name and column_name in fund_flow_df_with_volume.columns:
         # 兼容列名 '股票简称' (新API) 和 '股票名称' (旧代码可能期望)
-        name_col = '股票简称' if '股票简称' in fund_flow_df.columns else '股票名称'
-        
+        name_col = '股票简称' if '股票简称' in fund_flow_df_with_volume.columns else '股票名称'
+
         # 保留未过滤的全量数据用于回测记录
         original_df = fund_flow_df
 
+        # 使用带有量比和综合评分的数据框
+        working_df = fund_flow_df_with_volume
+
         # 0. 增加过滤逻辑: 在所有票中找出流通盘小于1000亿元的
         # 流通市值单位通常是元
-        if '流通市值' in fund_flow_df.columns:
+        if '流通市值' in working_df.columns:
             # 1000亿 = 1000 * 100000000 = 100,000,000,000
             # 过滤掉 >= 1000亿 的
-            filtered_df = fund_flow_df[fund_flow_df['流通市值'] < 1000_0000_0000]
+            filtered_df = working_df[working_df['流通市值'] < 1000_0000_0000]
             if filtered_df.empty:
                 print("警告: 过滤后数据为空，可能所有股票流通市值都超过阈值或者流通市值数据异常")
             else:
-                fund_flow_df = filtered_df
-        
-        # 1. 先排序并取Top N
-        ranked_df = fund_flow_df.sort_values(by=column_name, ascending=False).head(top_n).copy()
-        
-        if '流通市值' in fund_flow_df.columns:
-            result_cols = ['股票代码', name_col, '流通市值', column_name]
-        else:
-            result_cols = ['股票代码', name_col, column_name]
+                working_df = filtered_df
 
-        # 如果不是按净额排序，且净额存在，也展示净额以便参考
-        if column_name != '净额' and '净额' in fund_flow_df.columns:
-            result_cols.append('净额')
-            
-        # 2. 为这 Top N 获取 '当日量比' 数据 (暂时废弃)
-        # ranked_df = fetch_volume_ratio_for_list(ranked_df)
-        
-        # 3. 将 '当日量比' 加入展示列
-        # if '当日量比' in ranked_df.columns:
-        #    result_cols.append('当日量比')
-            
-        # 4. 触发保存历史 Top (仅当 period='即时' 且 排序为 ratio 时，或者是用户指定的主榜单)
-        # 通常我们只保存 '即时' 的 '增仓占比' 排名用于回测
-        if period == '即时' and sort_by == 'ratio':
+        # 1. 先排序并取Top N
+        ranked_df = working_df.sort_values(by=column_name, ascending=False).head(top_n).copy()
+
+        # 2. 构建显示列
+        if '流通市值' in working_df.columns:
+            result_cols = ['股票代码', name_col, '流通市值']
+        else:
+            result_cols = ['股票代码', name_col]
+
+        # 根据排序方式添加关键指标列
+        if sort_by == 'comprehensive':
+            # 综合评分排序：显示综合评分、增仓占比、放量评分
+            result_cols.extend(['综合评分', '增仓占比', '放量评分', '放量等级'])
+        else:
+            # 其他排序方式：显示主排序列
+            result_cols.append(column_name)
+            # 如果不是按净额排序，且净额存在，也展示净额以便参考
+            if column_name != '净额' and '净额' in working_df.columns:
+                result_cols.append('净额')
+
+        # 3. 添加量比相关列
+        if '当日量比' in ranked_df.columns and '当日量比' not in result_cols:
+           result_cols.append('当日量比')
+        if '放量等级' in ranked_df.columns and '放量等级' not in result_cols:
+           result_cols.append('放量等级')
+        if '放量评分' in ranked_df.columns and '放量评分' not in result_cols:
+           result_cols.append('放量评分')
+        if '综合评分' in ranked_df.columns and '综合评分' not in result_cols:
+           result_cols.append('综合评分')
+
+        # 4. 触发保存历史 Top (仅当 period='即时' 且按综合评分或增仓占比排序时)
+        if period == '即时' and sort_by in ['comprehensive', 'ratio']:
             try:
                 # A. 保存当日榜单前20到 daily_top_history
                 database.save_daily_top_list(ranked_df, period, top_n=20)
@@ -401,9 +555,11 @@ def rank_fund_flow(fund_flow_df: pd.DataFrame, sort_by: str = 'ratio', top_n: in
             except Exception as e:
                 print(f"Warning: 自动保存历史排名/回测数据失败: {e}")
 
-        return ranked_df[result_cols]
+        # 过滤result_cols，只保留ranked_df中实际存在的列
+        final_cols = [col for col in result_cols if col in ranked_df.columns]
+        return ranked_df[final_cols]
     else:
-        print(f"列名 {column_name} 不存在于数据中，可用列: {fund_flow_df.columns.tolist()}")
+        print(f"列名 {column_name} 不存在于数据中，可用列: {fund_flow_df_with_volume.columns.tolist()}")
         return pd.DataFrame()
 
 def save_to_csv(df: pd.DataFrame, filename: str, folder: str = 'analysis_results'):
@@ -429,14 +585,20 @@ def save_to_csv(df: pd.DataFrame, filename: str, folder: str = 'analysis_results
         # 自动识别并格式化数值列
         amount_cols = ['净额', '成交额', '资金流入净额', '大单净流入', '中单净流入', '小单净流入', '流入资金', '流出资金', '主力净流入', '流通市值']
         percent_cols = ['增仓占比', '涨跌幅', '换手率', '阶段涨跌幅', '连续换手率']
-        
+
         for col in amount_cols:
             if col in display_df.columns:
                 display_df[col] = display_df[col].apply(format_amount)
-                
+
         for col in percent_cols:
             if col in display_df.columns:
                 display_df[col] = display_df[col].apply(format_percentage)
+
+        # 格式化评分类列为小数或整数显示
+        if '放量评分' in display_df.columns:
+            display_df['放量评分'] = display_df['放量评分'].apply(lambda x: f"{int(x)}分" if pd.notna(x) else '-')
+        if '综合评分' in display_df.columns:
+            display_df['综合评分'] = display_df['综合评分'].apply(lambda x: f"{x:.1f}分" if pd.notna(x) else '-')
         
         display_df.to_csv(file_path, index=False, encoding='utf-8-sig')
         print(f"数据已保存到 {file_path}")
