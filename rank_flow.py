@@ -375,78 +375,141 @@ def classify_volume_level(volume_ratio):
     else:
         return "巨量"
 
-def fetch_volume_ratio_for_list(df: pd.DataFrame) -> pd.DataFrame:
+def calculate_volume_ratio_local(stock_code):
+    """
+    本地计算量比，避免API限制
+    量比 = 今日成交量 / 近5日平均成交量
+    """
+    try:
+        # 获取最近10天的历史数据（确保有足够数据计算5日均量）
+        end_date = datetime.now().strftime("%Y%m%d")
+        start_date = (datetime.now() - timedelta(days=15)).strftime("%Y%m%d")
+
+        df = ak.stock_zh_a_hist(symbol=stock_code, period="daily", start_date=start_date, end_date=end_date, adjust="")
+
+        if df.empty or len(df) < 2:
+            return np.nan
+
+        # 按日期升序排序
+        df = df.sort_values('日期')
+
+        # 今日成交量（最后一行）
+        today_volume = df.iloc[-1]['成交量']
+
+        # 近5日平均成交量（倒数第2到第6行，不包括今天）
+        if len(df) >= 6:
+            avg_volume_5d = df.iloc[-6:-1]['成交量'].mean()
+        elif len(df) >= 2:
+            # 数据不足5日，用全部历史数据（排除今天）
+            avg_volume_5d = df.iloc[:-1]['成交量'].mean()
+        else:
+            return np.nan
+
+        # 避免除以0
+        if avg_volume_5d == 0 or pd.isna(avg_volume_5d):
+            return np.nan
+
+        volume_ratio = today_volume / avg_volume_5d
+        return round(volume_ratio, 2)
+
+    except Exception:
+        # 静默失败，返回NaN
+        return np.nan
+
+def fetch_volume_ratio_for_list(df: pd.DataFrame, use_local_calculation: bool = True) -> pd.DataFrame:
     """
     为给定的股票列表获取 '当日量比' 数据，并进行智能分析
-    优化:
-    1. 批量获取全市场实时行情
-    2. 添加放量等级分类
-    3. 计算放量质量评分
-    4. 提供放量有效性判断
+
+    优化策略:
+    1. 优先使用本地计算（从历史数据计算量比，更稳定）
+    2. 备用方案：从全市场实时行情获取（可能受API限制）
+    3. 添加放量等级分类
+    4. 计算放量质量评分
     """
     if df.empty or '股票代码' not in df.columns:
         return df
 
-    print(f"正在批量获取量比数据并进行智能分析...")
+    print(f"正在计算量比数据并进行智能分析...")
 
-    try:
-        # 获取全市场实时行情，包含 '代码' 和 '量比' 列
-        spot_df = ak.stock_zh_a_spot_em()
+    # 方案1: 本地计算量比（推荐，更稳定）
+    if use_local_calculation:
+        print("使用本地算法计算量比（今日成交量 / 近5日均量）...")
 
-        if spot_df.empty or '量比' not in spot_df.columns:
-            print("警告: 无法获取实时量比数据 (API返回为空或无量比列)")
-            df['当日量比'] = np.nan
-            df['放量等级'] = "数据缺失"
-            df['放量评分'] = 0
-            return df
+        volume_ratios = {}
+        total = len(df)
+        success_count = 0
 
-        # 建立 代码 -> 量比 的映射
-        spot_df['代码'] = spot_df['代码'].astype(str)
-        spot_df['量比'] = pd.to_numeric(spot_df['量比'], errors='coerce')
+        for idx, row in df.iterrows():
+            code = row['股票代码']
+            # 显示进度（每10个打印一次）
+            if (idx + 1) % 10 == 0 or (idx + 1) == total:
+                print(f"  进度: {idx + 1}/{total}")
 
-        ratio_map = spot_df.set_index('代码')['量比'].to_dict()
+            ratio = calculate_volume_ratio_local(code)
+            if not pd.isna(ratio):
+                success_count += 1
+            volume_ratios[code] = ratio
 
-        # 映射量比到结果
-        df['当日量比'] = df['股票代码'].map(ratio_map)
+            # 避免请求过快
+            time.sleep(0.05)
 
-        # 添加放量等级分类
-        df['放量等级'] = df['当日量比'].apply(classify_volume_level)
+        # 映射量比到DataFrame
+        df['当日量比'] = df['股票代码'].map(volume_ratios)
+        print(f"成功计算 {success_count}/{total} 只股票的量比")
 
-        # 计算放量质量评分
-        df['放量评分'] = df.apply(calculate_volume_quality_score, axis=1)
+    else:
+        # 方案2: 从API获取（备用方案）
+        try:
+            print("尝试从API批量获取量比数据...")
+            spot_df = ak.stock_zh_a_spot_em()
 
-        # 计算综合评分（需要在有增仓占比的情况下）
-        if '增仓占比' in df.columns:
-            df['综合评分'] = df.apply(calculate_comprehensive_score, axis=1)
-        else:
-            df['综合评分'] = df['放量评分']  # 如果没有增仓占比，只用放量评分
+            if spot_df.empty or '量比' not in spot_df.columns:
+                print("警告: API返回为空，切换到本地计算模式")
+                return fetch_volume_ratio_for_list(df, use_local_calculation=True)
 
-        # 统计放量情况
-        volume_stats = df['放量等级'].value_counts()
-        print(f"量比分析完成:")
-        for level, count in volume_stats.items():
-            print(f"  {level}: {count}只")
+            # 建立映射
+            spot_df['代码'] = spot_df['代码'].astype(str)
+            spot_df['量比'] = pd.to_numeric(spot_df['量比'], errors='coerce')
+            ratio_map = spot_df.set_index('代码')['量比'].to_dict()
 
-        # 统计高质量放量股票数量（评分>=70）
-        high_quality_count = len(df[df['放量评分'] >= 70])
-        if high_quality_count > 0:
-            print(f"  高质量放量(评分≥70): {high_quality_count}只")
+            df['当日量比'] = df['股票代码'].map(ratio_map)
+            print("成功从API获取量比数据")
 
-        # 统计综合评分优秀的股票数量（评分>=80）
-        if '综合评分' in df.columns:
-            excellent_count = len(df[df['综合评分'] >= 80])
-            if excellent_count > 0:
-                print(f"  综合评分优秀(≥80): {excellent_count}只 ⭐")
+        except Exception as e:
+            print(f"API获取失败: {e}")
+            print("切换到本地计算模式...")
+            return fetch_volume_ratio_for_list(df, use_local_calculation=True)
 
-        return df
+    # 添加放量等级分类
+    df['放量等级'] = df['当日量比'].apply(classify_volume_level)
 
-    except Exception as e:
-        print(f"批量获取量比数据失败 (可能是API连接限制): {e}")
-        # 失败时不中断流程，仅返回空值的量比列
-        df['当日量比'] = np.nan
-        df['放量等级'] = "数据缺失"
-        df['放量评分'] = 0
-        return df
+    # 计算放量质量评分
+    df['放量评分'] = df.apply(calculate_volume_quality_score, axis=1)
+
+    # 计算综合评分（需要在有增仓占比的情况下）
+    if '增仓占比' in df.columns:
+        df['综合评分'] = df.apply(calculate_comprehensive_score, axis=1)
+    else:
+        df['综合评分'] = df['放量评分']
+
+    # 统计放量情况
+    volume_stats = df['放量等级'].value_counts()
+    print(f"量比分析完成:")
+    for level, count in volume_stats.items():
+        print(f"  {level}: {count}只")
+
+    # 统计高质量放量股票数量（评分>=70）
+    high_quality_count = len(df[df['放量评分'] >= 70])
+    if high_quality_count > 0:
+        print(f"  高质量放量(评分≥70): {high_quality_count}只")
+
+    # 统计综合评分优秀的股票数量（评分>=80）
+    if '综合评分' in df.columns:
+        excellent_count = len(df[df['综合评分'] >= 80])
+        if excellent_count > 0:
+            print(f"  综合评分优秀(≥80): {excellent_count}只 ⭐")
+
+    return df
 
 def rank_fund_flow(fund_flow_df: pd.DataFrame, sort_by: str = 'comprehensive', top_n: int = 50, period: str = None) -> pd.DataFrame:
     """
