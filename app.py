@@ -7,6 +7,9 @@ import json
 import os
 import time
 import database
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import akshare as ak
 
 # --- Configuration & Utility Functions ---
 st.set_page_config(page_title="Stock Manager AI", page_icon="📈", layout="wide")
@@ -32,6 +35,72 @@ def format_money_for_show(val):
             return f"{val/10000:.2f}万"
         return f"{val:.2f}"
     return val
+
+def fetch_and_plot_kline(stock_code, stock_name=None):
+    """获取并绘制K线图 (带均线和成交量)"""
+    try:
+        from datetime import datetime
+        end_date = datetime.now().strftime("%Y%m%d")
+        start_date = (datetime.now() - pd.Timedelta(days=120)).strftime("%Y%m%d")
+        
+        # 获取日线一般历史数据
+        df = ak.stock_zh_a_hist(symbol=stock_code, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
+        
+        if df.empty:
+            st.warning(f"无法获取 {stock_code} 的K线数据")
+            return
+
+        # 确保按日期升序
+        df = df.sort_values('日期')
+        
+        # 计算均线
+        df['MA5'] = df['收盘'].rolling(window=5).mean()
+        df['MA10'] = df['收盘'].rolling(window=10).mean()
+        df['MA20'] = df['收盘'].rolling(window=20).mean()
+
+        # 创建子图: 行1 K线, 行2 成交量
+        fig = make_subplots(
+            rows=2, cols=1, 
+            shared_xaxes=True, 
+            vertical_spacing=0.03, 
+            row_heights=[0.7, 0.3],
+            subplot_titles=(f'{stock_name or stock_code} 日K线图', '成交量')
+        )
+
+        # 1. K线
+        fig.add_trace(go.Candlestick(
+            x=df['日期'],
+            open=df['开盘'], high=df['最高'], low=df['最低'], close=df['收盘'],
+            name='K线',
+            increasing_line_color='#ef5350', decreasing_line_color='#26a69a'
+        ), row=1, col=1)
+
+        # 2. 均线
+        fig.add_trace(go.Scatter(x=df['日期'], y=df['MA5'], name='MA5', line=dict(color='black', width=1)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df['日期'], y=df['MA10'], name='MA10', line=dict(color='orange', width=1)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df['日期'], y=df['MA20'], name='MA20', line=dict(color='purple', width=1)), row=1, col=1)
+
+        # 3. 成交量
+        # 颜色根据涨跌: 收盘 >= 开盘 为红, 否则为绿
+        colors = ['#ef5350' if c >= o else '#26a69a' for c, o in zip(df['收盘'], df['开盘'])]
+        fig.add_trace(go.Bar(
+            x=df['日期'], y=df['成交量'], 
+            name='成交量',
+            marker_color=colors
+        ), row=2, col=1)
+
+        # 布局调整
+        fig.update_layout(
+            xaxis_rangeslider_visible=False,
+            height=600,
+            margin=dict(l=50, r=50, t=30, b=30),
+            hovermode='x unified'
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"绘制K线图失败: {e}")
 
 # --- CSS Styling for "Hover Sidebar" feel (Optional) ---
 # Streamlit sidebar is click-to-open on mobile, but fixed on desktop.
@@ -63,6 +132,14 @@ with st.sidebar:
 if selected_page == "🔍 智能选股":
     st.header("🔍 资金流向智能选股")
     
+    # K线快速查看
+    with st.expander("📈 个股K线快速查看", expanded=False):
+        c_k1, c_k2 = st.columns([1, 3])
+        with c_k1:
+            kline_code = st.text_input("输入股票代码 (如 600519):", max_chars=6, key="kline_home")
+        if kline_code:
+            fetch_and_plot_kline(kline_code)
+
     # 获取当前时间用于展示数据更新状态
     current_time_str = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
     st.markdown(f"> 🕒 **最后更新时间:** {current_time_str}")
@@ -254,9 +331,18 @@ elif selected_page == "🤖 AI 预测分析":
                     st.download_button("📥 下载预测报告", csv, "AI_Prediction.csv", "text/csv")
         
         with tab2:
-            st.write("输入代码进行单独诊断")
-            code_input = st.text_input("股票代码 (如 000001)")
-            name_input = st.text_input("股票简称 (可选)")
+            st.markdown("### 🎯 单股深度诊断")
+            
+            c1, c2 = st.columns([1, 3])
+            with c1:
+                code_input = st.text_input("输入股票代码 (如 000001):", max_chars=6)
+                name_input = st.text_input("输入股票名称 (可选):")
+            
+            if code_input:
+                # 绘制K线图
+                st.markdown("---")
+                fetch_and_plot_kline(code_input, name_input)
+                st.markdown("---")
             
             if st.button("开始诊断"):
                 if code_input:

@@ -3,6 +3,7 @@ import pandas as pd
 import requests
 import json
 import time
+import numpy as np
 from datetime import datetime
 import config
 
@@ -18,23 +19,72 @@ class StockPredictor:
 
     def fetch_history_data(self, stock_code):
         """
-        获取股票最近的K线数据
+        获取股票历史K线数据并计算技术指标
         """
         try:
-            # 获取最近一个月的日线数据，取最后5条
+            # 获取最近45天的日线数据 (用于计算指标)
             end_date = datetime.now().strftime("%Y%m%d")
-            start_date = (datetime.now() - pd.Timedelta(days=30)).strftime("%Y%m%d")
+            start_date = (datetime.now() - pd.Timedelta(days=60)).strftime("%Y%m%d")
             
             # akshare 获取个股历史数据
             df = ak.stock_zh_a_hist(symbol=stock_code, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
             
             if df.empty:
                 return "无历史数据"
+            
+            # 必须保证数据按日期升序
+            if '日期' in df.columns:
+                df = df.sort_values(by='日期')
                 
-            # 取最后5行，保留关键列
-            recent_df = df.tail(5)[['日期', '开盘', '收盘', '最高', '最低', '成交量', '涨跌幅']]
-            # 格式化为字符串表格
-            return recent_df.to_string(index=False)
+            # --- 计算技术指标 ---
+            # 1. 均线 MA
+            df['MA5'] = df['收盘'].rolling(window=5).mean()
+            df['MA10'] = df['收盘'].rolling(window=10).mean()
+            df['MA20'] = df['收盘'].rolling(window=20).mean()
+            
+            # 2. RSI (6日, 12日)
+            def calculate_rsi(data, window=6):
+                delta = data.diff()
+                gain = (delta.where(delta > 0, 0)).fillna(0)
+                loss = (-delta.where(delta < 0, 0)).fillna(0)
+                avg_gain = gain.rolling(window=window).mean()
+                avg_loss = loss.rolling(window=window).mean()
+                rs = avg_gain / avg_loss.replace(0, 1e-9)
+                return 100 - (100 / (1 + rs))
+            
+            df['RSI6'] = calculate_rsi(df['收盘'], 6)
+            
+            # 3. MACD (12, 26, 9)
+            exp1 = df['收盘'].ewm(span=12, adjust=False).mean()
+            exp2 = df['收盘'].ewm(span=26, adjust=False).mean()
+            df['MACD'] = exp1 - exp2
+            df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+            df['Hist'] = df['MACD'] - df['Signal']
+
+            # 取最后5行用于显示趋势
+            recent_df = df.tail(5).copy()
+            
+            # 格式化指标数据
+            result_str = "【近期 5 日关键数据与指标】\n"
+            result_str += "日期      | 收盘 | 涨跌幅 | MA5 | MA20 | RSI6 | MACD\n"
+            result_str += "-" * 60 + "\n"
+            
+            for _, row in recent_df.iterrows():
+                try:
+                    date_short = row['日期'][5:]
+                    close = f"{row['收盘']:.2f}"
+                    pct = f"{row['涨跌幅']:.2f}%"
+                    ma5 = f"{row['MA5']:.2f}"
+                    ma20 = f"{row['MA20']:.2f}"
+                    rsi = f"{row['RSI6']:.1f}" if not pd.isna(row['RSI6']) else "-"
+                    macd = f"{row['Hist']:.3f}" # 显示红绿柱
+                    
+                    result_str += f"{date_short} | {close} | {pct} | {ma5} | {ma20} | {rsi} | {macd}\n"
+                except:
+                    continue
+                    
+            return result_str
+            
         except Exception as e:
             return f"获取历史行情失败: {e}"
 
