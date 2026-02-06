@@ -236,6 +236,10 @@ def calculate_price_momentum_score(price_change):
     if pd.isna(price_change):
         return 0
 
+    # 处理字符串格式（如 "5.23%" 或 "-3.45%"）
+    if isinstance(price_change, str):
+        price_change = float(price_change.replace('%', ''))
+
     pct = float(price_change)
 
     if pct >= 9.9:  # 涨停或接近涨停
@@ -312,6 +316,10 @@ def calculate_position_increase_score(position_ratio):
     """
     if pd.isna(position_ratio):
         return 0
+
+    # 处理字符串格式（如 "20.01%" 或 "-5.3%"）
+    if isinstance(position_ratio, str):
+        position_ratio = float(position_ratio.replace('%', ''))
 
     ratio = float(position_ratio)
 
