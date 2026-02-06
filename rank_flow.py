@@ -230,7 +230,7 @@ import concurrent.futures
 
 def calculate_price_momentum_score(price_change):
     """
-    计算涨跌幅评分 (0-100分)
+    计算涨跌幅评分 (0-100分) - 严格标准
     评估价格动量强度
     """
     if pd.isna(price_change):
@@ -244,27 +244,31 @@ def calculate_price_momentum_score(price_change):
 
     if pct >= 9.9:  # 涨停或接近涨停
         return 100
-    elif pct >= 7:  # 强势
+    elif pct >= 8:  # 强势上涨
         return 90
-    elif pct >= 5:  # 较强上涨
+    elif pct >= 6:  # 较强上涨
         return 80
-    elif pct >= 3:  # 温和上涨
+    elif pct >= 4:  # 温和上涨
         return 70
-    elif pct >= 1:  # 小幅上涨
+    elif pct >= 2:  # 小幅上涨
+        return 60
+    elif pct >= 1:  # 微涨
         return 50
-    elif pct >= -1:  # 平盘附近
+    elif pct >= 0:  # 平盘附近
+        return 40
+    elif pct >= -2:  # 小幅下跌
         return 30
-    elif pct >= -3:  # 小幅下跌
+    elif pct >= -4:  # 明显下跌
         return 20
-    elif pct >= -5:  # 明显下跌
+    elif pct >= -6:  # 大幅下跌
         return 10
-    else:  # 大幅下跌
+    else:  # 暴跌
         return 0
 
 def calculate_turnover_rate_score(turnover_rate):
     """
-    计算换手率评分 (0-100分)
-    评估交易活跃度，理想范围3-15%
+    计算换手率评分 (0-100分) - 严格标准
+    评估交易活跃度，理想范围5-10%（缩窄）
     """
     if pd.isna(turnover_rate):
         return 0
@@ -275,20 +279,20 @@ def calculate_turnover_rate_score(turnover_rate):
 
     rate = float(turnover_rate)
 
-    if 3 <= rate <= 15:  # 理想活跃范围
+    if 5 <= rate <= 10:  # 最理想活跃范围（缩窄）
         return 100
-    elif 2 <= rate < 3 or 15 < rate <= 20:  # 可接受
-        return 75
-    elif 1 <= rate < 2 or 20 < rate <= 30:  # 偏离理想
-        return 50
-    elif 0.5 <= rate < 1 or 30 < rate <= 40:  # 过低或过高
-        return 25
-    else:  # 极端情况
-        return 10
+    elif 3 <= rate < 5 or 10 < rate <= 15:  # 可接受
+        return 80
+    elif 2 <= rate < 3 or 15 < rate <= 20:  # 偏离理想
+        return 60
+    elif 1 <= rate < 2 or 20 < rate <= 30:  # 过低或过高
+        return 40
+    else:  # 极端情况（换手率过低或过高都不好）
+        return 20
 
 def calculate_turnover_amount_score(turnover_amount):
     """
-    计算成交额评分 (0-100分)
+    计算成交额评分 (0-100分) - 严格标准
     评估流动性，成交额越大越能保证真实性
     """
     if pd.isna(turnover_amount) or turnover_amount <= 0:
@@ -296,23 +300,23 @@ def calculate_turnover_amount_score(turnover_amount):
 
     amount = float(turnover_amount)
 
-    if amount >= 10_0000_0000:  # >= 10亿
+    if amount >= 20_0000_0000:  # >= 20亿
         return 100
-    elif amount >= 5_0000_0000:  # >= 5亿
+    elif amount >= 10_0000_0000:  # >= 10亿
         return 85
-    elif amount >= 2_0000_0000:  # >= 2亿
+    elif amount >= 5_0000_0000:  # >= 5亿
         return 70
-    elif amount >= 1_0000_0000:  # >= 1亿
+    elif amount >= 2_0000_0000:  # >= 2亿
         return 55
-    elif amount >= 5000_0000:    # >= 5000万
+    elif amount >= 1_0000_0000:  # >= 1亿
         return 40
-    else:  # < 5000万
+    else:  # < 1亿
         return 20
 
 def calculate_position_increase_score(position_ratio):
     """
-    计算增仓评分 (0-100分)
-    根据增仓占比计算分数
+    计算增仓评分 (0-100分) - 严格标准
+    根据增仓占比计算分数，提高门槛
     """
     if pd.isna(position_ratio):
         return 0
@@ -323,33 +327,29 @@ def calculate_position_increase_score(position_ratio):
 
     ratio = float(position_ratio)
 
-    if ratio >= 20:
+    if ratio >= 25:  # 超强增仓
         return 100
-    elif ratio >= 15:
-        return 95
-    elif ratio >= 12:
+    elif ratio >= 20:  # 强增仓
         return 90
-    elif ratio >= 10:
-        return 85
-    elif ratio >= 8:
-        return 75
-    elif ratio >= 6:
-        return 65
-    elif ratio >= 5:
-        return 55
-    elif ratio >= 4:
-        return 48
-    elif ratio >= 3:
+    elif ratio >= 15:  # 明显增仓
+        return 80
+    elif ratio >= 12:  # 较强增仓
+        return 70
+    elif ratio >= 10:  # 中等增仓
+        return 60
+    elif ratio >= 8:  # 温和增仓
+        return 50
+    elif ratio >= 6:  # 小幅增仓
         return 40
-    elif ratio >= 2:
-        return 32
-    elif ratio >= 1:
-        return 25
-    elif ratio >= 0:
-        return 15
+    elif ratio >= 4:  # 微增仓
+        return 30
+    elif ratio >= 2:  # 弱增仓
+        return 20
+    elif ratio >= 0:  # 几乎无增仓
+        return 10
     else:
-        # 负增仓（资金流出），按比例递减
-        return max(0, 15 + ratio * 2)  # 每-1%扣2分
+        # 负增仓（资金流出），严格扣分
+        return max(0, 10 + ratio * 3)  # 每-1%扣3分
 
 def calculate_comprehensive_score(row):
     """
