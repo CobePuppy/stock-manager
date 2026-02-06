@@ -228,73 +228,82 @@ def get_fund_flow_data(period: str = '即时') -> pd.DataFrame:
 
 import concurrent.futures
 
-def calculate_volume_quality_score(row):
+def calculate_price_momentum_score(price_change):
     """
-    计算放量质量评分 (0-100分)
-    综合考虑: 量比、成交额、换手率、流通市值
+    计算涨跌幅评分 (0-100分)
+    评估价格动量强度
     """
-    score = 0
+    if pd.isna(price_change):
+        return 0
 
-    # 1. 量比评分 (最高40分)
-    volume_ratio = row.get('当日量比', 0)
-    if pd.notna(volume_ratio) and volume_ratio > 0:
-        if volume_ratio >= 5:
-            score += 40  # 巨量
-        elif volume_ratio >= 3:
-            score += 35  # 强放量
-        elif volume_ratio >= 2:
-            score += 25  # 明显放量
-        elif volume_ratio >= 1.5:
-            score += 15  # 温和放量
-        else:
-            score += 5   # 量比偏低
+    pct = float(price_change)
 
-    # 2. 成交额评分 (最高30分)
-    # 成交额越大，越能证明放量的有效性
-    turnover = row.get('成交额', 0)
-    if pd.notna(turnover) and turnover > 0:
-        if turnover >= 10_0000_0000:  # >= 10亿
-            score += 30
-        elif turnover >= 5_0000_0000:  # >= 5亿
-            score += 25
-        elif turnover >= 2_0000_0000:  # >= 2亿
-            score += 20
-        elif turnover >= 1_0000_0000:  # >= 1亿
-            score += 15
-        elif turnover >= 5000_0000:    # >= 5000万
-            score += 10
-        else:
-            score += 5  # 成交额偏小，放量可信度低
+    if pct >= 9.9:  # 涨停或接近涨停
+        return 100
+    elif pct >= 7:  # 强势
+        return 90
+    elif pct >= 5:  # 较强上涨
+        return 80
+    elif pct >= 3:  # 温和上涨
+        return 70
+    elif pct >= 1:  # 小幅上涨
+        return 50
+    elif pct >= -1:  # 平盘附近
+        return 30
+    elif pct >= -3:  # 小幅下跌
+        return 20
+    elif pct >= -5:  # 明显下跌
+        return 10
+    else:  # 大幅下跌
+        return 0
 
-    # 3. 换手率评分 (最高20分)
-    # 合理的换手率范围: 3%-15%，过高或过低都减分
-    turnover_rate = row.get('换手率', 0)
-    if pd.notna(turnover_rate):
-        # 如果是字符串格式，需要处理
-        if isinstance(turnover_rate, str):
-            turnover_rate = float(turnover_rate.replace('%', ''))
+def calculate_turnover_rate_score(turnover_rate):
+    """
+    计算换手率评分 (0-100分)
+    评估交易活跃度，理想范围3-15%
+    """
+    if pd.isna(turnover_rate):
+        return 0
 
-        if 3 <= turnover_rate <= 15:
-            score += 20  # 理想换手率
-        elif 2 <= turnover_rate < 3 or 15 < turnover_rate <= 20:
-            score += 15  # 可接受范围
-        elif 1 <= turnover_rate < 2 or 20 < turnover_rate <= 30:
-            score += 10  # 偏离理想范围
-        else:
-            score += 5   # 过高或过低
+    # 处理字符串格式
+    if isinstance(turnover_rate, str):
+        turnover_rate = float(turnover_rate.replace('%', ''))
 
-    # 4. 流通市值评分 (最高10分)
-    # 中等市值的放量更可信，过小容易操纵，过大不容易放量
-    market_cap = row.get('流通市值', 0)
-    if pd.notna(market_cap) and market_cap > 0:
-        if 50_0000_0000 <= market_cap <= 500_0000_0000:  # 50亿-500亿
-            score += 10  # 理想市值范围
-        elif 20_0000_0000 <= market_cap < 50_0000_0000 or 500_0000_0000 < market_cap <= 800_0000_0000:
-            score += 7   # 可接受范围
-        else:
-            score += 4   # 过小或过大
+    rate = float(turnover_rate)
 
-    return min(score, 100)  # 确保不超过100分
+    if 3 <= rate <= 15:  # 理想活跃范围
+        return 100
+    elif 2 <= rate < 3 or 15 < rate <= 20:  # 可接受
+        return 75
+    elif 1 <= rate < 2 or 20 < rate <= 30:  # 偏离理想
+        return 50
+    elif 0.5 <= rate < 1 or 30 < rate <= 40:  # 过低或过高
+        return 25
+    else:  # 极端情况
+        return 10
+
+def calculate_turnover_amount_score(turnover_amount):
+    """
+    计算成交额评分 (0-100分)
+    评估流动性，成交额越大越能保证真实性
+    """
+    if pd.isna(turnover_amount) or turnover_amount <= 0:
+        return 0
+
+    amount = float(turnover_amount)
+
+    if amount >= 10_0000_0000:  # >= 10亿
+        return 100
+    elif amount >= 5_0000_0000:  # >= 5亿
+        return 85
+    elif amount >= 2_0000_0000:  # >= 2亿
+        return 70
+    elif amount >= 1_0000_0000:  # >= 1亿
+        return 55
+    elif amount >= 5000_0000:    # >= 5000万
+        return 40
+    else:  # < 5000万
+        return 20
 
 def calculate_position_increase_score(position_ratio):
     """
@@ -336,23 +345,42 @@ def calculate_position_increase_score(position_ratio):
 
 def calculate_comprehensive_score(row):
     """
-    计算综合评分 (0-100分)
-    综合考虑增仓占比(60%)和放量质量(40%)
+    计算综合评分 (0-100分) - 新版多维度评分系统
+
+    评分维度和权重:
+    - 增仓占比 50%: 资金流入强度（核心指标）
+    - 涨跌幅   20%: 价格动量（趋势确认）
+    - 换手率   15%: 交易活跃度（市场关注）
+    - 成交额   15%: 流动性保障（避免小票）
 
     设计理念:
-    - 增仓占比：主要指标，反映资金流入强度
-    - 放量评分：辅助指标，验证放量真实性
-    - 只有两者都好，才能得高分
+    - 增仓强 + 价格涨 + 活跃度高 + 流动性好 = 高分
+    - 多维度验证，降低单一指标误判风险
+    - 所有数据无需额外计算，速度极快
     """
-    # 获取增仓评分
+    # 1. 增仓占比评分（权重50%）
     position_ratio = row.get('增仓占比', 0)
     position_score = calculate_position_increase_score(position_ratio)
 
-    # 获取放量评分
-    volume_score = row.get('放量评分', 0)
+    # 2. 涨跌幅评分（权重20%）
+    price_change = row.get('涨跌幅', 0)
+    momentum_score = calculate_price_momentum_score(price_change)
 
-    # 综合评分：增仓60% + 放量40%
-    comprehensive = position_score * 0.6 + volume_score * 0.4
+    # 3. 换手率评分（权重15%）
+    turnover_rate = row.get('换手率', 0)
+    activity_score = calculate_turnover_rate_score(turnover_rate)
+
+    # 4. 成交额评分（权重15%）
+    turnover_amount = row.get('成交额', 0)
+    liquidity_score = calculate_turnover_amount_score(turnover_amount)
+
+    # 综合评分 = 加权平均
+    comprehensive = (
+        position_score * 0.50 +
+        momentum_score * 0.20 +
+        activity_score * 0.15 +
+        liquidity_score * 0.15
+    )
 
     return round(comprehensive, 1)
 
@@ -416,98 +444,47 @@ def calculate_volume_ratio_local(stock_code):
         # 静默失败，返回NaN
         return np.nan
 
-def fetch_volume_ratio_for_list(df: pd.DataFrame, use_local_calculation: bool = True) -> pd.DataFrame:
+def add_comprehensive_scores(df: pd.DataFrame) -> pd.DataFrame:
     """
-    为给定的股票列表获取 '当日量比' 数据，并进行智能分析
+    为股票列表添加多维度综合评分（极速版）
 
-    优化策略:
-    1. 优先使用本地计算（从历史数据计算量比，更稳定）
-    2. 备用方案：从全市场实时行情获取（可能受API限制）
-    3. 添加放量等级分类
-    4. 计算放量质量评分
+    新版评分系统：
+    - 增仓占比 50%: 资金流入强度
+    - 涨跌幅   20%: 价格动量
+    - 换手率   15%: 交易活跃度
+    - 成交额   15%: 流动性保障
+
+    优势：
+    - 所有数据已包含在DataFrame中，无需额外API调用
+    - 计算速度极快（毫秒级完成5000只股票）
+    - 多维度验证，更准确预测上涨概率
     """
     if df.empty or '股票代码' not in df.columns:
         return df
 
-    print(f"正在计算量比数据并进行智能分析...")
+    print(f"正在计算多维度综合评分（极速模式）...")
 
-    # 方案1: 本地计算量比（推荐，更稳定）
-    if use_local_calculation:
-        print("使用本地算法计算量比（今日成交量 / 近5日均量）...")
+    # 计算综合评分（已包含所有子维度评分）
+    df['综合评分'] = df.apply(calculate_comprehensive_score, axis=1)
 
-        volume_ratios = {}
-        total = len(df)
-        success_count = 0
+    # 单独计算各维度评分用于展示（可选）
+    df['增仓评分'] = df['增仓占比'].apply(calculate_position_increase_score)
+    df['动量评分'] = df['涨跌幅'].apply(calculate_price_momentum_score)
+    df['活跃度评分'] = df['换手率'].apply(calculate_turnover_rate_score)
+    df['流动性评分'] = df['成交额'].apply(calculate_turnover_amount_score)
 
-        for idx, row in df.iterrows():
-            code = row['股票代码']
-            # 显示进度（每10个打印一次）
-            if (idx + 1) % 10 == 0 or (idx + 1) == total:
-                print(f"  进度: {idx + 1}/{total}")
+    # 统计综合评分分布
+    score_ranges = [
+        ('优秀(≥80分)', len(df[df['综合评分'] >= 80])),
+        ('良好(70-79分)', len(df[(df['综合评分'] >= 70) & (df['综合评分'] < 80)])),
+        ('中等(60-69分)', len(df[(df['综合评分'] >= 60) & (df['综合评分'] < 70)])),
+        ('一般(<60分)', len(df[df['综合评分'] < 60]))
+    ]
 
-            ratio = calculate_volume_ratio_local(code)
-            if not pd.isna(ratio):
-                success_count += 1
-            volume_ratios[code] = ratio
-
-            # 避免请求过快
-            time.sleep(0.05)
-
-        # 映射量比到DataFrame
-        df['当日量比'] = df['股票代码'].map(volume_ratios)
-        print(f"成功计算 {success_count}/{total} 只股票的量比")
-
-    else:
-        # 方案2: 从API获取（备用方案）
-        try:
-            print("尝试从API批量获取量比数据...")
-            spot_df = ak.stock_zh_a_spot_em()
-
-            if spot_df.empty or '量比' not in spot_df.columns:
-                print("警告: API返回为空，切换到本地计算模式")
-                return fetch_volume_ratio_for_list(df, use_local_calculation=True)
-
-            # 建立映射
-            spot_df['代码'] = spot_df['代码'].astype(str)
-            spot_df['量比'] = pd.to_numeric(spot_df['量比'], errors='coerce')
-            ratio_map = spot_df.set_index('代码')['量比'].to_dict()
-
-            df['当日量比'] = df['股票代码'].map(ratio_map)
-            print("成功从API获取量比数据")
-
-        except Exception as e:
-            print(f"API获取失败: {e}")
-            print("切换到本地计算模式...")
-            return fetch_volume_ratio_for_list(df, use_local_calculation=True)
-
-    # 添加放量等级分类
-    df['放量等级'] = df['当日量比'].apply(classify_volume_level)
-
-    # 计算放量质量评分
-    df['放量评分'] = df.apply(calculate_volume_quality_score, axis=1)
-
-    # 计算综合评分（需要在有增仓占比的情况下）
-    if '增仓占比' in df.columns:
-        df['综合评分'] = df.apply(calculate_comprehensive_score, axis=1)
-    else:
-        df['综合评分'] = df['放量评分']
-
-    # 统计放量情况
-    volume_stats = df['放量等级'].value_counts()
-    print(f"量比分析完成:")
-    for level, count in volume_stats.items():
-        print(f"  {level}: {count}只")
-
-    # 统计高质量放量股票数量（评分>=70）
-    high_quality_count = len(df[df['放量评分'] >= 70])
-    if high_quality_count > 0:
-        print(f"  高质量放量(评分≥70): {high_quality_count}只")
-
-    # 统计综合评分优秀的股票数量（评分>=80）
-    if '综合评分' in df.columns:
-        excellent_count = len(df[df['综合评分'] >= 80])
-        if excellent_count > 0:
-            print(f"  综合评分优秀(≥80): {excellent_count}只 ⭐")
+    print(f"[OK] 评分完成！综合评分分布:")
+    for label, count in score_ranges:
+        if count > 0:
+            print(f"  {label}: {count}只")
 
     return df
 
@@ -523,9 +500,9 @@ def rank_fund_flow(fund_flow_df: pd.DataFrame, sort_by: str = 'comprehensive', t
     :param period: 周期名称(如'即时'), 如果提供且为'即时'，则会触发保存Top20到历史数据库
     :return: 排名后的DataFrame
     """
-    # 先为所有数据获取量比和计算综合评分（在过滤和排序之前）
+    # 先为所有数据计算多维度综合评分（在过滤和排序之前）
     # 这样综合评分排序才有意义
-    fund_flow_df_with_volume = fetch_volume_ratio_for_list(fund_flow_df.copy())
+    fund_flow_df_with_scores = add_comprehensive_scores(fund_flow_df.copy())
 
     if sort_by == 'comprehensive':
         column_name = '综合评分'
@@ -538,15 +515,15 @@ def rank_fund_flow(fund_flow_df: pd.DataFrame, sort_by: str = 'comprehensive', t
         column_names = {'large': '大单净流入', 'medium': '中单净流入', 'small': '小单净流入'}
         column_name = column_names.get(sort_by)
 
-    if column_name and column_name in fund_flow_df_with_volume.columns:
+    if column_name and column_name in fund_flow_df_with_scores.columns:
         # 兼容列名 '股票简称' (新API) 和 '股票名称' (旧代码可能期望)
-        name_col = '股票简称' if '股票简称' in fund_flow_df_with_volume.columns else '股票名称'
+        name_col = '股票简称' if '股票简称' in fund_flow_df_with_scores.columns else '股票名称'
 
         # 保留未过滤的全量数据用于回测记录
         original_df = fund_flow_df
 
         # 使用带有量比和综合评分的数据框
-        working_df = fund_flow_df_with_volume
+        working_df = fund_flow_df_with_scores
 
         # 0. 增加过滤逻辑: 在所有票中找出流通盘小于1000亿元的
         # 流通市值单位通常是元
@@ -570,8 +547,8 @@ def rank_fund_flow(fund_flow_df: pd.DataFrame, sort_by: str = 'comprehensive', t
 
         # 根据排序方式添加关键指标列
         if sort_by == 'comprehensive':
-            # 综合评分排序：显示综合评分、增仓占比、放量评分
-            result_cols.extend(['综合评分', '增仓占比', '放量评分', '放量等级'])
+            # 综合评分排序：显示综合评分及各维度子评分
+            result_cols.extend(['综合评分', '增仓占比', '涨跌幅', '换手率', '成交额'])
         else:
             # 其他排序方式：显示主排序列
             result_cols.append(column_name)
@@ -579,15 +556,11 @@ def rank_fund_flow(fund_flow_df: pd.DataFrame, sort_by: str = 'comprehensive', t
             if column_name != '净额' and '净额' in working_df.columns:
                 result_cols.append('净额')
 
-        # 3. 添加量比相关列
-        if '当日量比' in ranked_df.columns and '当日量比' not in result_cols:
-           result_cols.append('当日量比')
-        if '放量等级' in ranked_df.columns and '放量等级' not in result_cols:
-           result_cols.append('放量等级')
-        if '放量评分' in ranked_df.columns and '放量评分' not in result_cols:
-           result_cols.append('放量评分')
-        if '综合评分' in ranked_df.columns and '综合评分' not in result_cols:
-           result_cols.append('综合评分')
+        # 3. 添加综合评分及各维度评分列（如果存在且未添加）
+        score_cols = ['综合评分', '增仓评分', '动量评分', '活跃度评分', '流动性评分']
+        for col in score_cols:
+            if col in ranked_df.columns and col not in result_cols:
+                result_cols.append(col)
 
         # 4. 触发保存历史 Top (仅当 period='即时' 且按综合评分或增仓占比排序时)
         if period == '即时' and sort_by in ['comprehensive', 'ratio']:
@@ -622,7 +595,7 @@ def rank_fund_flow(fund_flow_df: pd.DataFrame, sort_by: str = 'comprehensive', t
         final_cols = [col for col in result_cols if col in ranked_df.columns]
         return ranked_df[final_cols]
     else:
-        print(f"列名 {column_name} 不存在于数据中，可用列: {fund_flow_df_with_volume.columns.tolist()}")
+        print(f"列名 {column_name} 不存在于数据中，可用列: {fund_flow_df_with_scores.columns.tolist()}")
         return pd.DataFrame()
 
 def save_to_csv(df: pd.DataFrame, filename: str, folder: str = 'analysis_results'):
