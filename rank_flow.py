@@ -18,9 +18,18 @@ import time
 import sys
 import database # Import database module
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 # 全局缓存，避免重复请求同一只股票的量比数据
 _VOLUME_RATIO_CACHE = {}
+# 全局数据缓存，避免单次运行中多次请求同一类型数据（如即时排行）
+_FUND_FLOW_CACHE = {}
+
+# 全局锁，用于线程安全的打印和计数
+_PRINT_LOCK = Lock()
+_REQUEST_DELAY = 0.05  # 50ms延迟（并发模式下可以更短）
+_MAX_WORKERS = 15  # 并发线程数（可根据网络情况调整）
 
 def convert_unit(x):
     if pd.isna(x):
@@ -64,6 +73,7 @@ def format_percentage(x):
     except:
         return str(x)
 
+
 def clean_old_files(directory: str, days: int = 7):
     """
     删除目录下超过指定天数的文件，并清理已过期的数据库数据
@@ -97,38 +107,111 @@ def clean_old_files(directory: str, days: int = 7):
 
 def get_fund_flow_data(period: str = '即时') -> pd.DataFrame:
     """
-    获取资金流入数据 (优先读取数据库缓存)
+    获取资金流入数据 (一级:内存缓存 -> 二级:数据库缓存 -> 三级:API获取)
     :param period: '即时', '3日排行', '5日排行', '10日排行', '20日排行'
     :return: 包含资金流入数据的DataFrame
     """
+    # 0. 检查内存缓存 (防止主程序多次调用或递归调用时重复获取)
+    if period in _FUND_FLOW_CACHE:
+        print(f"检测到内存缓存数据，直接读取 (Period: {period})")
+        return _FUND_FLOW_CACHE[period]
+
     # 初始化数据库（确保表存在）
     database.init_db()
 
     # 清理过期
     # clean_old_files 已经在main中被调用，这里可以不调用，或者也调用防守
     
-    # 1. 尝试从数据库读取
+    # 1. 尝试从数据库读取原始数据（优先）
     try:
-        df_cache = database.get_fund_flow_cache(period)
+        trade_date = database.get_stock_trade_date()
+        print(f"[缓存检查] 交易日期: {trade_date}, 查询周期: {period}")
+
+        # 优先尝试读取原始数据
+        df_raw = database.get_raw_fund_flow_cache(period)
+        print(f"[缓存检查] 原始数据表返回 {len(df_raw)} 条数据")
+
+        if not df_raw.empty:
+            print(f"[缓存命中] 从原始数据表读取，准备计算指标...")
+            df_cache = df_raw
+        else:
+            # 如果原始数据表没有，尝试读取计算结果表（兼容旧数据）
+            df_cache = database.get_fund_flow_cache(period)
+            print(f"[缓存检查] 计算结果表返回 {len(df_cache)} 条数据")
+
         if not df_cache.empty:
-            print(f"检测到今日数据库缓存数据，直接读取 (Period: {period})")
+            print(f"[缓存命中] 检测到今日数据库缓存数据，直接读取 (Period: {period})")
             # 补全股票代码前导0 (数据库Text类型应该保留了，但防守一下)
             if '股票代码' in df_cache.columns:
                 df_cache['股票代码'] = df_cache['股票代码'].astype(str).apply(lambda x: x.zfill(6))
 
-            # 如果是即时数据且缺少主力净额，使用净额字段
-            if period == '即时' and '主力净额' not in df_cache.columns:
-                print("[提示] 缓存数据缺少主力净额，使用'净额'字段（主力资金）")
-                if '净额' in df_cache.columns:
-                    df_cache['主力净额'] = df_cache['净额']
-                    # 重新计算增仓占比
-                    if '成交额' in df_cache.columns:
-                        df_cache['增仓占比'] = (df_cache['主力净额'] / df_cache['成交额']) * 100
-                    print("成功补充主力净额")
-                else:
-                    print("[ERROR] 缓存数据中未找到'净额'字段")
-                    return pd.DataFrame()
+            # 如果是即时数据，需要处理超大单数据
+            if period == '即时':
+                # 检查是否已有主力资金流数据
+                if '主力净流入' not in df_cache.columns or df_cache['主力净流入'].isna().all():
+                    print("[提示] 缓存数据缺少主力资金流数据，尝试从主力资金流缓存表读取...")
 
+                    # 尝试从主力资金流缓存表读取
+                    try:
+                        trade_date = database.get_stock_trade_date()
+                        conn = database.get_connection()
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='main_force_cache'")
+
+                        if cursor.fetchone():
+                            query = "SELECT * FROM main_force_cache WHERE cache_date = ?"
+                            df_main_force = pd.read_sql(query, conn, params=(trade_date,))
+
+                            if not df_main_force.empty:
+                                # 恢复列名并合并
+                                if 'stock_code' in df_main_force.columns:
+                                    df_main_force = df_main_force.rename(columns={'stock_code': '股票代码'})
+                                if 'cache_date' in df_main_force.columns:
+                                    df_main_force = df_main_force.drop(columns=['cache_date'])
+
+                                # 合并主力资金流数据
+                                df_cache = df_cache.merge(df_main_force, on='股票代码', how='left')
+                                df_cache['超大单净额'] = df_cache['超大单净额'].fillna(0)
+                                df_cache['大单净额'] = df_cache['大单净额'].fillna(0)
+                                df_cache['主力净流入'] = df_cache['主力净流入'].fillna(0)
+                                print(f"[OK] 成功从主力资金流缓存读取数据")
+                            else:
+                                # 数据严谨性要求：缓存表为空时，抛出异常
+                                conn.close()
+                                raise ValueError("[数据完整性错误] 主力资金流缓存表为空，无法保证数据准确性")
+                        else:
+                            # 数据严谨性要求：缓存表不存在时，抛出异常
+                            conn.close()
+                            raise ValueError("[数据完整性错误] 主力资金流缓存表不存在，无法保证数据准确性")
+
+                        conn.close()
+                    except ValueError:
+                        # 重新抛出数据完整性错误，不使用净额作为后备
+                        raise
+                    except Exception as ex:
+                        # 数据严谨性要求：读取失败时，抛出异常而不是使用净额
+                        raise RuntimeError(f"[数据完整性错误] 读取主力资金流缓存失败: {ex}，无法保证数据准确性") from ex
+
+                # 使用主力净流入作为主力净额（超大单 + 大单）
+                df_cache['主力净额'] = df_cache['主力净流入']
+
+                # 重新计算增仓占比
+                if '成交额' in df_cache.columns:
+                    df_cache['增仓占比'] = (df_cache['主力净额'] / df_cache['成交额'].replace(0, np.nan)) * 100
+
+                # 计算流通市值（如果缺失）
+                if '流通市值' not in df_cache.columns and '成交额' in df_cache.columns and '换手率' in df_cache.columns:
+                    def parse_rate_val(x):
+                        if pd.isna(x): return np.nan
+                        s = str(x).replace('%', '')
+                        try: return float(s)
+                        except: return np.nan
+
+                    temp_rates = df_cache['换手率'].apply(parse_rate_val)
+                    df_cache['流通市值'] = df_cache['成交额'] / (temp_rates.replace(0, np.nan) / 100)
+
+            # 写入内存缓存
+            _FUND_FLOW_CACHE[period] = df_cache
             return df_cache
     except Exception as e:
         print(f"数据库读取异常: {e}, 转为API获取")
@@ -144,7 +227,12 @@ def get_fund_flow_data(period: str = '即时') -> pd.DataFrame:
             fund_flow_df['股票代码'] = fund_flow_df['股票代码'].astype(str).str.zfill(6)
             
             # 筛选股票代码以 6, 3, 0 开头的 (前导0已补全，可以直接匹配)
+            # 强制确保列名为字符串，去除可能存在的引号或空格，再匹配
+            fund_flow_df['股票代码'] = fund_flow_df['股票代码'].astype(str).str.strip().str.replace("'", "").str.replace('"', "")
+            fund_flow_df['股票代码'] = fund_flow_df['股票代码'].str.zfill(6)
+            
             fund_flow_df = fund_flow_df[fund_flow_df['股票代码'].str.startswith(('6', '3', '0'))]
+            print(f"筛选 A股(6/3/0)后剩余股票数量: {len(fund_flow_df)} 只")
             
             # 数据类型转换与指标计算
             numeric_cols = ['最新价', '流入资金', '流出资金', '净额', '成交额', '资金流入净额']
@@ -153,22 +241,13 @@ def get_fund_flow_data(period: str = '即时') -> pd.DataFrame:
                     fund_flow_df[col] = fund_flow_df[col].apply(convert_unit)
 
             if period == '即时':
-                # 直接使用即时数据的"净额"字段计算增仓占比
-                # 根据接口文档，即时数据包含: 序号、股票代码、股票简称、最新价、涨跌幅、换手率、流入资金、流出资金、净额、成交额
-                if '净额' in fund_flow_df.columns:
-                    # 将净额字段映射为主力净额（保持向后兼容）
-                    fund_flow_df['主力净额'] = fund_flow_df['净额']
-                    print(f"[提示] 使用即时数据的净额字段计算增仓占比")
-                else:
-                    print("[ERROR] 未找到'净额'字段")
-                    return pd.DataFrame()
-
-                # 计算增仓占比: 增仓占比 = 净额 / 成交额 * 100
-                if '成交额' in fund_flow_df.columns and '主力净额' in fund_flow_df.columns:
-                    fund_flow_df['增仓占比'] = (fund_flow_df['主力净额'] / fund_flow_df['成交额'].replace(0, np.nan)) * 100
+                print("[筛选预处理] 提前计算流通市值并过滤，以减少不必要的爬虫请求...")
                 
-                # 计算并添加 '流通市值'
+                # 1. 提前计算 '流通市值'
                 # 流通市值 = 成交额 / (换手率 / 100)
+                # 确保列名没有空格
+                fund_flow_df.columns = [c.strip() for c in fund_flow_df.columns]
+                
                 if '成交额' in fund_flow_df.columns and '换手率' in fund_flow_df.columns:
                      def parse_rate_val(x):
                          if pd.isna(x): return np.nan
@@ -179,9 +258,66 @@ def get_fund_flow_data(period: str = '即时') -> pd.DataFrame:
                      temp_rates = fund_flow_df['换手率'].apply(parse_rate_val)
                      # 避免除以0
                      fund_flow_df['流通市值'] = fund_flow_df['成交额'] / (temp_rates.replace(0, np.nan) / 100)
+                else:
+                    print("[Error] 缺少计算流通市值的关键列('成交额'或'换手率')")
 
-                # 确保以前的逻辑兼容
-                fund_flow_df['主力净流入'] = fund_flow_df.get('净额', 0)
+                # 2. 提前执行市值过滤 (流通市值 < 1000亿)
+                # 1000亿 = 1000 * 100000000 = 100,000,000,000
+                if '流通市值' in fund_flow_df.columns:
+                    original_count = len(fund_flow_df)
+                    # 过滤掉 >= 1000亿 的 (保留 < 1000亿)
+                    # 注意: 处理NaN值，如果算出NaN通常意味着数据不全，安全起见可以保留或过滤，这里选择过滤掉以免报错
+                    fund_flow_df = fund_flow_df[fund_flow_df['流通市值'].notna() & (fund_flow_df['流通市值'] < 1000_0000_0000)]
+                    print(f"[筛选结果] 过滤大盘股(>=1000亿)后: {original_count} -> {len(fund_flow_df)} 只")
+                else:
+                    print("[Warning] 未能计算流通市值，将跳过市值过滤，处理全量数据！")
+                
+                # 3. 开始获取主力资金流数据（超大单 + 大单）
+                print(f"\n[步骤1/2] 准备获取 {len(fund_flow_df)} 只目标股票的主力资金流数据...")
+
+                # 提取股票代码列表（已筛选6、3、0开头 且 市值<1000亿）
+                stock_codes = fund_flow_df['股票代码'].tolist()
+
+                # 串行获取所有股票的主力资金流数据
+                print(f"[步骤2/2] 获取主力资金流数据（超大单 + 大单）...")
+                df_main_force = fetch_all_main_force_flow(stock_codes)
+
+                if not df_main_force.empty:
+                    # 合并主力资金流数据
+                    fund_flow_df = fund_flow_df.merge(
+                        df_main_force,
+                        on='股票代码',
+                        how='left'
+                    )
+
+                    # 将缺失值填充为0
+                    fund_flow_df['超大单净额'] = fund_flow_df['超大单净额'].fillna(0)
+                    fund_flow_df['大单净额'] = fund_flow_df['大单净额'].fillna(0)
+                    fund_flow_df['主力净流入'] = fund_flow_df['主力净流入'].fillna(0)
+
+                    # 使用主力净流入作为主力净额（超大单 + 大单）
+                    fund_flow_df['主力净额'] = fund_flow_df['主力净流入']
+
+                    print(f"[OK] 成功合并主力资金流数据")
+                else:
+                    # 数据严谨性要求：无法获取主力资金流数据时，抛出异常
+                    raise RuntimeError(
+                        "[数据完整性错误] 未能获取主力资金流数据（超大单+大单），"
+                        "无法计算准确的增仓占比。请检查网络连接或稍后重试。"
+                    )
+
+                # 计算增仓占比: 增仓占比 = 主力净流入 / 成交额 * 100
+                # 主力净流入 = (超大单 + 大单) 买入额 - (超大单 + 大单) 卖出额
+                if '成交额' in fund_flow_df.columns and '主力净额' in fund_flow_df.columns:
+                    fund_flow_df['增仓占比'] = (fund_flow_df['主力净额'] / fund_flow_df['成交额'].replace(0, np.nan)) * 100
+                
+                # '流通市值' 已经提前计算了，这里不需要再算一次
+                
+                # 确保以前的逻辑兼容 (仅当主力净额存在时使用)
+                if '主力净额' in fund_flow_df.columns:
+                    fund_flow_df['主力净流入'] = fund_flow_df['主力净额']
+                else:
+                    fund_flow_df['主力净流入'] = np.nan
 
             elif '日排行' in period:
                 # N日排行返回列: '资金流入净额'
@@ -237,13 +373,40 @@ def get_fund_flow_data(period: str = '即时') -> pd.DataFrame:
                          print(f"估算增仓占比失败: {ex}")
                          fund_flow_df['增仓占比'] = 0.0 
             
-            # 保存到数据库缓存
+            # 保存到数据库缓存（双表架构：原始数据 + 计算结果）
             try:
-                database.save_fund_flow_cache(fund_flow_df, period)
-                print(f"数据已更新并缓存至数据库")
-            except Exception as e:
-                print(f"写入数据库缓存失败: {e}")
+                print(f"[缓存保存] 准备保存 {len(fund_flow_df)} 条数据到数据库...")
 
+                # 1. 保存原始数据（未经任何计算）
+                # 需要先保存原始数据，因为fund_flow_df后续会被修改
+                # 创建原始数据副本（只包含API返回的原始字段）
+                original_cols = ['股票代码', '股票简称', '最新价', '涨跌幅', '换手率', '净额', '成交额',
+                                 '流入资金', '流出资金', '资金流入净额', '连续换手率', '阶段涨跌幅']
+                df_raw_to_save = fund_flow_df.copy()
+
+                # 只保留原始字段（如果存在）
+                cols_to_save = [col for col in original_cols if col in df_raw_to_save.columns]
+                # 同时保留主力资金流数据（如果有）
+                for col in ['超大单净额', '大单净额', '主力净流入']:
+                    if col in df_raw_to_save.columns:
+                        cols_to_save.append(col)
+
+                df_raw_to_save = df_raw_to_save[cols_to_save]
+                database.save_raw_fund_flow_cache(df_raw_to_save, period)
+
+                # 2. 保存计算结果（包含增仓占比、流通市值等计算字段）
+                database.save_fund_flow_cache(fund_flow_df, period)
+
+                print(f"[缓存保存] 数据已成功保存至数据库 (原始数据 + 计算结果, 周期: {period})")
+            except Exception as e:
+                print(f"[缓存保存] 写入数据库缓存失败: {e}")
+                import traceback
+                traceback.print_exc()
+
+        # 写入内存缓存
+        if not fund_flow_df.empty:
+            _FUND_FLOW_CACHE[period] = fund_flow_df
+            
         return fund_flow_df
     except Exception as e:
         print(f"获取资金流入数据失败: {e}")
@@ -251,6 +414,226 @@ def get_fund_flow_data(period: str = '即时') -> pd.DataFrame:
 
 
 import concurrent.futures
+
+def fetch_single_stock_main_force_flow(stock_code: str, debug: bool = False) -> dict:
+    """
+    获取单只股票的主力资金流数据（超大单 + 大单）
+
+    :param stock_code: 股票代码（6位）
+    :param debug: 是否打印调试信息
+    :return: 包含超大单净额和大单净额的字典，失败返回None
+    """
+    try:
+        # 判断市场：6开头是上海，3和0开头是深圳
+        market = "sh" if stock_code.startswith('6') else "sz"
+
+        # 调用akshare接口获取单只股票资金流数据
+        try:
+            df = ak.stock_individual_fund_flow(stock=stock_code, market=market)
+        except Exception as e:
+            if debug:
+                print(f"[DEBUG] {stock_code}: 获取资金流数据失败 - {e}")
+            return None
+
+        if df.empty:
+            if debug:
+                print(f"[DEBUG] {stock_code}: 返回数据为空")
+            return None
+
+        # 获取最新一天的数据（最后一行）
+        latest_data = df.iloc[-1]
+
+        if debug:
+            print(f"[DEBUG] {stock_code}: 可用列名: {latest_data.index.tolist()}")
+            print(f"[DEBUG] {stock_code}: 最新日期: {latest_data.get('日期', '未知')}")
+
+        # 提取主力资金流数据（超大单 + 大单）
+        result = {
+            '股票代码': stock_code
+        }
+
+        # 提取超大单净额
+        super_large_net = convert_unit(latest_data['超大单净流入-净额'])
+        result['超大单净额'] = super_large_net
+
+        # 提取大单净额
+        large_net = convert_unit(latest_data['大单净流入-净额'])
+        result['大单净额'] = large_net
+
+        # 计算主力净流入（超大单 + 大单）
+        result['主力净流入'] = super_large_net + large_net
+
+        if debug:
+            print(f"[DEBUG] {stock_code}: 超大单净额 = {super_large_net}")
+            print(f"[DEBUG] {stock_code}: 大单净额 = {large_net}")
+            print(f"[DEBUG] {stock_code}: 主力净流入 = {result['主力净流入']}")
+
+        return result
+
+    except Exception as e:
+        if debug:
+            print(f"[DEBUG] {stock_code}: 异常 - {e}")
+        return None
+
+def save_main_force_cache(df: pd.DataFrame):
+    """
+    保存主力资金流数据到数据库缓存（超大单 + 大单）
+
+    :param df: 包含主力资金流数据的DataFrame
+    """
+    if df.empty:
+        return
+
+    try:
+        conn = database.get_connection()
+        cursor = conn.cursor()
+
+        # 创建主力资金流缓存表（如果不存在）
+        cursor.execute('''CREATE TABLE IF NOT EXISTS main_force_cache (
+                            stock_code TEXT PRIMARY KEY,
+                            cache_date TEXT,
+                            超大单净额 REAL,
+                            大单净额 REAL,
+                            主力净流入 REAL
+                        )''')
+
+        trade_date = database.get_stock_trade_date()
+
+        # 准备数据
+        df_save = df.copy()
+        if '股票代码' in df_save.columns:
+            df_save = df_save.rename(columns={'股票代码': 'stock_code'})
+
+        df_save['cache_date'] = trade_date
+
+        # 删除当天旧数据
+        conn.execute("DELETE FROM main_force_cache WHERE cache_date = ?", (trade_date,))
+        conn.commit()
+
+        # 保存新数据
+        df_save.to_sql('main_force_cache', conn, if_exists='append', index=False)
+
+        print(f"[缓存保存] 已保存 {len(df_save)} 只股票的主力资金流数据到数据库")
+
+    except Exception as e:
+        print(f"[缓存保存] 保存失败: {e}")
+    finally:
+        conn.close()
+
+def fetch_all_main_force_flow(stock_codes: list, use_cache: bool = True) -> pd.DataFrame:
+    """
+    批量获取多只股票的主力资金流数据（串行版本，避免API限流）
+
+    :param stock_codes: 股票代码列表
+    :param use_cache: 是否使用数据库缓存
+    :return: 包含主力资金流数据的DataFrame（超大单净额、大单净额、主力净流入）
+    """
+    if not stock_codes:
+        return pd.DataFrame()
+
+    # 1. 尝试从数据库缓存读取
+    if use_cache:
+        try:
+            trade_date = database.get_stock_trade_date()
+            conn = database.get_connection()
+
+            # 检查是否存在主力资金流缓存表
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='main_force_cache'")
+
+            if cursor.fetchone():
+                # 表存在，尝试读取今日数据
+                query = "SELECT * FROM main_force_cache WHERE cache_date = ?"
+                df_cache = pd.read_sql(query, conn, params=(trade_date,))
+                conn.close()
+
+                if not df_cache.empty:
+                    # 恢复列名
+                    if 'stock_code' in df_cache.columns:
+                        df_cache = df_cache.rename(columns={'stock_code': '股票代码'})
+                    if 'cache_date' in df_cache.columns:
+                        df_cache = df_cache.drop(columns=['cache_date'])
+
+                    print(f"[缓存命中] 从数据库读取到 {len(df_cache)} 只股票的主力资金流数据")
+                    return df_cache
+            else:
+                conn.close()
+        except Exception as e:
+            print(f"[缓存读取] 数据库读取失败: {e}，转为API获取")
+
+    # 2. 从API获取（并发线程池版本）
+    total = len(stock_codes)
+    print(f"开始获取{total}只股票的主力资金流数据（并发模式，{_MAX_WORKERS}线程）...")
+
+    results = []
+    success_count = [0]  # 使用列表以便在闭包中修改
+    completed_count = [0]
+    start_time = time.time()
+
+    # 线程安全的结果收集
+    results_lock = Lock()
+
+    def fetch_with_progress(code):
+        """带进度更新的获取函数"""
+        result = fetch_single_stock_main_force_flow(code, debug=False)
+
+        # 线程安全地更新结果和计数
+        with results_lock:
+            if result:
+                results.append(result)
+                success_count[0] += 1
+
+            completed_count[0] += 1
+            current = completed_count[0]
+
+            # 每10个更新一次进度（避免刷新过快）
+            if current % 10 == 0 or current == total:
+                progress = current / total * 100
+                elapsed = time.time() - start_time
+
+                if current > 0:
+                    avg_time = elapsed / current
+                    remaining = avg_time * (total - current)
+                    eta_min = int(remaining // 60)
+                    eta_sec = int(remaining % 60)
+
+                    print(f"\r进度: {current}/{total} ({progress:.1f}%) | 成功: {success_count[0]} | 速度: {current/elapsed:.1f}个/秒 | 预计剩余: {eta_min}分{eta_sec}秒",
+                          end="", flush=True)
+
+        # 短暂延迟，避免过度并发导致API限流
+        time.sleep(_REQUEST_DELAY)
+        return result
+
+    # 使用线程池并发处理
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
+        # 提交所有任务
+        futures = [executor.submit(fetch_with_progress, code) for code in stock_codes]
+
+        # 等待所有任务完成
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                print(f"\n[WARNING] 任务执行异常: {e}")
+
+    # 完成后换行
+    elapsed_total = int(time.time() - start_time)
+    print(f"\n完成！成功获取 {success_count[0]}/{total} 只股票的主力资金流数据")
+    print(f"总耗时: {elapsed_total}秒 | 平均速度: {total/elapsed_total:.1f}个/秒")
+
+    if results:
+        df_result = pd.DataFrame(results)
+
+        # 3. 保存到数据库缓存
+        if use_cache and not df_result.empty:
+            try:
+                save_main_force_cache(df_result)
+            except Exception as e:
+                print(f"[缓存保存] 保存主力资金流数据到数据库失败: {e}")
+
+        return df_result
+    else:
+        return pd.DataFrame()
 
 def calculate_price_momentum_score(price_change):
     """

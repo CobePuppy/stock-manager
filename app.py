@@ -27,6 +27,16 @@ def save_watchlist(codes):
 def get_data_cache_key(period):
     return f"data_{period}_{pd.Timestamp.now().strftime('%Y%m%d_%H')}"
 
+@st.cache_data(ttl=3600, show_spinner="正在获取数据...")
+def get_fund_flow_data_cached(period):
+    """
+    带Streamlit缓存的资金流数据获取函数
+
+    使用 @st.cache_data 避免Streamlit重新运行时多次调用API
+    TTL设置为1小时，确保数据及时更新
+    """
+    return rf.get_fund_flow_data(period=period)
+
 def format_money_for_show(val):
     if isinstance(val, (int, float)):
         if abs(val) > 100000000:
@@ -40,14 +50,42 @@ def fetch_and_plot_kline(stock_code, stock_name=None):
     """获取并绘制K线图 (带均线和成交量)"""
     try:
         from datetime import datetime
+        import time
+
         end_date = datetime.now().strftime("%Y%m%d")
         start_date = (datetime.now() - pd.Timedelta(days=120)).strftime("%Y%m%d")
-        
-        # 获取日线一般历史数据
-        df = ak.stock_zh_a_hist(symbol=stock_code, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
-        
-        if df.empty:
-            st.warning(f"无法获取 {stock_code} 的K线数据")
+
+        # 添加重试机制以应对网络不稳定
+        max_retries = 3
+        retry_delay = 1  # 初始延迟1秒
+        df = None
+
+        for attempt in range(max_retries):
+            try:
+                # 获取日线历史数据
+                df = ak.stock_zh_a_hist(
+                    symbol=stock_code,
+                    period="daily",
+                    start_date=start_date,
+                    end_date=end_date,
+                    adjust="qfq"
+                )
+
+                if df is not None and not df.empty:
+                    break  # 成功获取数据，跳出重试循环
+
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    # 还有重试机会，等待后重试
+                    st.info(f"连接超时，正在重试 ({attempt + 1}/{max_retries})...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # 指数退避
+                else:
+                    # 最后一次尝试也失败了
+                    raise e
+
+        if df is None or df.empty:
+            st.warning(f"无法获取 {stock_code} 的K线数据，请稍后重试")
             return
 
         # 确保按日期升序
@@ -100,7 +138,18 @@ def fetch_and_plot_kline(stock_code, stock_name=None):
         st.plotly_chart(fig, use_container_width=True)
 
     except Exception as e:
-        st.error(f"绘制K线图失败: {e}")
+        error_msg = str(e)
+        if "Connection" in error_msg or "Remote" in error_msg or "timeout" in error_msg.lower():
+            st.error(f"⚠️ 网络连接失败，请检查网络或稍后重试")
+            st.caption(f"详细错误: {error_msg}")
+        else:
+            st.error(f"绘制K线图失败: {e}")
+
+        # 提供建议
+        st.info("💡 **建议**: 如果持续出现此错误，可能是网络不稳定或API限流，请：\n"
+                "1. 稍等片刻后重试\n"
+                "2. 检查网络连接\n"
+                "3. 减少同时请求的股票数量")
 
 # --- CSS Styling for "Hover Sidebar" feel (Optional) ---
 # Streamlit sidebar is click-to-open on mobile, but fixed on desktop.
@@ -192,7 +241,7 @@ if selected_page == "🔍 智能选股":
                             except Exception as e:
                                 st.warning(f"清除缓存失败: {e}")
 
-                    df = rf.get_fund_flow_data(period=period)
+                    df = get_fund_flow_data_cached(period=period)
                     if '日排行' in period and '增仓占比' not in df.columns:
                         df['增仓占比'] = float('nan')
                     st.session_state[f'df_{period}'] = df
@@ -200,11 +249,10 @@ if selected_page == "🔍 智能选股":
                 df = st.session_state.get(f'df_{period}')
 
                 if df is not None and not df.empty:
-                    # 排名计算 - 优先使用综合评分（增仓+放量）
+                    # 排名计算 - 使用4维度快速评分（禁用量比和PE）
                     sort_by = 'comprehensive' if '增仓占比' in df.columns else 'net'
-                    # 传入 period 参数以触发自动保存(如果是即时数据)
-                    # 禁用量比计算（API不稳定，太慢）- 使用4维度快速评分
-                    ranked_df = rf.rank_fund_flow(df, sort_by=sort_by, top_n=config.TOP_N, period=period, enable_volume_ratio=False)
+                    # 只获取Top3结果，使用数据库缓存数据
+                    ranked_df = rf.rank_fund_flow(df, sort_by=sort_by, top_n=3, period=period, enable_volume_ratio=False)
                     
                     # 格式化展示
                     display_df = ranked_df.copy()
@@ -312,9 +360,10 @@ elif selected_page == "🤖 AI 预测分析":
             if target_df is None:
                 st.info("尚未选择数据。请先去 '智能选股' 页面获取数据，或点击下方按钮直接获取即时 Top 数据。")
                 if st.button("获取此页面的即时 Top 数据"):
-                     df = rf.get_fund_flow_data(period='即时')
+                     df = get_fund_flow_data_cached(period='即时')
                      if not df.empty:
-                        target_df = rf.rank_fund_flow(df, sort_by='comprehensive', top_n=config.PREDICT_TOP_N, period='即时')
+                        # 只获取Top3，禁用量比计算
+                        target_df = rf.rank_fund_flow(df, sort_by='comprehensive', top_n=3, period='即时', enable_volume_ratio=False)
                         st.session_state['prediction_target'] = target_df
                         st.rerun()
             
@@ -473,7 +522,10 @@ elif selected_page == "🤖 AI 预测分析":
                                 st.warning(f"未找到包含 '{name_input_search}' 的股票")
             else:
                 # 从排名列表选择
-                df_select = st.session_state.get('df_即时') or st.session_state.get('prediction_target')
+                # 修复DataFrame布尔判断问题
+                df_select = st.session_state.get('df_即时')
+                if df_select is None or (isinstance(df_select, pd.DataFrame) and df_select.empty):
+                    df_select = st.session_state.get('prediction_target')
                 if df_select is not None and not df_select.empty:
                     name_col = '股票简称' if '股票简称' in df_select.columns else '股票名称'
                     # 取前30个
@@ -645,7 +697,7 @@ elif selected_page == "⭐ 自选关注":
         # 尝试从即时数据中匹配自选股的资金流
         if st.button("刷新自选股数据"):
             with st.spinner("正在获取最新数据..."):
-                df_all = rf.get_fund_flow_data(period='即时')
+                df_all = get_fund_flow_data_cached(period='即时')
                 if not df_all.empty:
                     # Filter
                     df_watch = df_all[df_all['股票代码'].isin(watchlist)]

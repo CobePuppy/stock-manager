@@ -3,6 +3,7 @@ import pandas as pd
 import config
 from datetime import datetime, timedelta
 import os
+import json
 
 def get_history_connection():
     return sqlite3.connect(config.HISTORY_DB_PATH)
@@ -195,11 +196,125 @@ def get_stock_trade_date():
         
     return trade_date.strftime("%Y-%m-%d")
 
+def save_raw_fund_flow_cache(df, period):
+    """
+    保存原始资金流数据到数据库（不包含任何计算字段）
+
+    :param df: 原始数据DataFrame
+    :param period: 周期类型
+    """
+    if df.empty:
+        return
+
+    conn = get_connection()
+    try:
+        # 创建原始数据表（如果不存在）
+        cursor = conn.cursor()
+        cursor.execute('''CREATE TABLE IF NOT EXISTS raw_fund_flow_cache (
+                            stock_code TEXT,
+                            period_type TEXT,
+                            cache_date TEXT,
+                            data_json TEXT,
+                            PRIMARY KEY (stock_code, period_type, cache_date)
+                        )''')
+
+        # 使用交易日日期
+        trade_date = get_stock_trade_date()
+
+        # 转换DataFrame为JSON格式保存（保留所有原始字段）
+        df_save = df.copy()
+        if '股票代码' in df_save.columns:
+            df_save['股票代码'] = df_save['股票代码'].astype(str)
+
+        # 删除序号列（如果有）
+        if '序号' in df_save.columns:
+            df_save = df_save.drop(columns=['序号'])
+
+        # 删除同日期的旧数据
+        conn.execute("DELETE FROM raw_fund_flow_cache WHERE period_type = ? AND cache_date = ?", (period, trade_date))
+        conn.commit()
+
+        # 逐行保存为JSON
+        data_to_save = []
+        for _, row in df_save.iterrows():
+            stock_code = str(row.get('股票代码', ''))
+            if not stock_code:
+                continue
+
+            # 将整行转为JSON字符串
+            row_dict = row.to_dict()
+            row_json = json.dumps(row_dict, ensure_ascii=False, default=str)
+
+            data_to_save.append((stock_code, period, trade_date, row_json))
+
+        # 批量插入
+        cursor.executemany(
+            "INSERT INTO raw_fund_flow_cache (stock_code, period_type, cache_date, data_json) VALUES (?, ?, ?, ?)",
+            data_to_save
+        )
+
+        conn.commit()
+        print(f"[原始数据] 已保存 {len(data_to_save)} 只股票的原始数据到数据库")
+
+    except Exception as e:
+        print(f"保存原始数据失败: {e}")
+    finally:
+        conn.close()
+
+def get_raw_fund_flow_cache(period):
+    """
+    读取原始资金流数据（不包含计算字段）
+
+    :param period: 周期类型
+    :return: 原始数据DataFrame
+    """
+    date_str = get_stock_trade_date()
+    conn = get_connection()
+    try:
+        # 检查表是否存在
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='raw_fund_flow_cache'")
+        if not cursor.fetchone():
+            return pd.DataFrame()
+
+        query = "SELECT stock_code, data_json FROM raw_fund_flow_cache WHERE period_type = ? AND cache_date = ?"
+        cursor.execute(query, (period, date_str))
+        rows = cursor.fetchall()
+
+        if not rows:
+            return pd.DataFrame()
+
+        # 解析JSON并重建DataFrame
+        data_list = []
+        for stock_code, data_json in rows:
+            try:
+                row_dict = json.loads(data_json)
+                data_list.append(row_dict)
+            except:
+                continue
+
+        if not data_list:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(data_list)
+
+        # 确保股票代码列存在
+        if '股票代码' not in df.columns:
+            return pd.DataFrame()
+
+        return df
+
+    except Exception as e:
+        print(f"读取原始数据失败: {e}")
+        return pd.DataFrame()
+    finally:
+        conn.close()
+
 def save_fund_flow_cache(df, period):
     """保存资金流数据到缓存表"""
     if df.empty:
         return
-        
+
     conn = get_connection()
     try:
         # 转换所有列为字符串以避免类型冲突，或者pandas会自动处理
