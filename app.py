@@ -132,53 +132,6 @@ with st.sidebar:
 if selected_page == "🔍 智能选股":
     st.header("🔍 资金流向智能选股")
 
-    # K线快速查看 - 优化版（默认展开）
-    with st.expander("📈 个股K线快速查看", expanded=True):
-        col_k1, col_k2, col_k3 = st.columns([2, 2, 1])
-
-        with col_k1:
-            kline_code = st.text_input("输入股票代码 (如 600519):", max_chars=6, key="kline_home")
-
-        with col_k2:
-            kline_name = st.text_input("或输入股票名称 (如 贵州茅台):", key="kline_name_home")
-
-        # 处理名称搜索
-        if kline_name and not kline_code:
-            # 尝试从当前数据中查找
-            df_current = st.session_state.get('df_即时') or st.session_state.get(f'df_{st.session_state.get("last_period", "即时")}')
-            if df_current is not None and not df_current.empty:
-                name_col = '股票简称' if '股票简称' in df_current.columns else '股票名称'
-                matched = df_current[df_current[name_col].str.contains(kline_name, na=False, case=False)]
-                if not matched.empty:
-                    kline_code = matched.iloc[0]['股票代码']
-                    st.info(f"找到股票: {matched.iloc[0][name_col]} ({kline_code})")
-                else:
-                    st.warning(f"未找到包含 '{kline_name}' 的股票")
-
-        # 最近查看历史
-        if 'kline_history' not in st.session_state:
-            st.session_state['kline_history'] = []
-
-        if kline_code and kline_code not in st.session_state['kline_history']:
-            st.session_state['kline_history'].insert(0, kline_code)
-            st.session_state['kline_history'] = st.session_state['kline_history'][:5]  # 只保留最近5个
-
-        # 显示历史记录
-        if st.session_state['kline_history']:
-            st.markdown("**最近查看:** " + " | ".join([f"`{code}`" for code in st.session_state['kline_history']]))
-
-        if kline_code:
-            # 尝试获取股票名称
-            df_current = st.session_state.get('df_即时') or st.session_state.get(f'df_{st.session_state.get("last_period", "即时")}')
-            stock_name = None
-            if df_current is not None and not df_current.empty:
-                matched = df_current[df_current['股票代码'] == kline_code]
-                if not matched.empty:
-                    name_col = '股票简称' if '股票简称' in df_current.columns else '股票名称'
-                    stock_name = matched.iloc[0][name_col]
-
-            fetch_and_plot_kline(kline_code, stock_name)
-
     # 获取当前时间用于展示数据更新状态
     current_time_str = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
     st.markdown(f"> 🕒 **最后更新时间:** {current_time_str}")
@@ -255,16 +208,7 @@ if selected_page == "🔍 智能选股":
                             if pd.api.types.is_numeric_dtype(display_df[c]):
                                 display_df[c] = display_df[c].apply(format_money_for_show)
 
-                    st.dataframe(
-                        display_df,
-                        width="stretch",
-                        column_config={
-                            "股票代码": st.column_config.TextColumn("代码"),
-                            "增仓占比": st.column_config.NumberColumn("增仓占比", format="%.2f%%"),
-                        }
-                    )
-                    
-                    # 快捷操作区
+                    # 快捷操作区 - 查看K线
                     st.markdown("### 🛠️ 快捷操作")
 
                     # 构造选项列表: "600355 ST精伦"
@@ -299,6 +243,18 @@ if selected_page == "🔍 智能选股":
                                 st.success(f"✅ 已添加 {len(to_add_codes)} 只股票到自选")
                             else:
                                 st.warning("请先选择股票")
+
+                    st.markdown("---")
+
+                    # 数据表格
+                    st.dataframe(
+                        display_df,
+                        width="stretch",
+                        column_config={
+                            "股票代码": st.column_config.TextColumn("代码"),
+                            "增仓占比": st.column_config.NumberColumn("增仓占比", format="%.2f%%"),
+                        }
+                    )
                 else:
                     st.error("未能获取数据，请检查网络或稍后重试")
             except Exception as e:
