@@ -182,7 +182,8 @@ if selected_page == "🔍 智能选股":
                     # 排名计算 - 优先使用综合评分（增仓+放量）
                     sort_by = 'comprehensive' if '增仓占比' in df.columns else 'net'
                     # 传入 period 参数以触发自动保存(如果是即时数据)
-                    ranked_df = rf.rank_fund_flow(df, sort_by=sort_by, top_n=config.TOP_N, period=period)
+                    # 禁用量比计算（API不稳定，太慢）- 使用4维度快速评分
+                    ranked_df = rf.rank_fund_flow(df, sort_by=sort_by, top_n=config.TOP_N, period=period, enable_volume_ratio=False)
                     
                     # 格式化展示
                     display_df = ranked_df.copy()
@@ -213,6 +214,7 @@ if selected_page == "🔍 智能选股":
 
                     # 构造选项列表: "600355 ST精伦"
                     name_col = '股票简称' if '股票简称' in ranked_df.columns else '股票名称'
+                    ranked_df = ranked_df.copy()  # 创建副本避免SettingWithCopyWarning
                     ranked_df['label'] = ranked_df['股票代码'].astype(str) + " " + ranked_df[name_col].astype(str)
 
                     col_op1, col_op2 = st.columns(2)
