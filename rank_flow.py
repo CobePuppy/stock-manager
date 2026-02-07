@@ -153,18 +153,19 @@ def get_fund_flow_data(period: str = '即时') -> pd.DataFrame:
                     fund_flow_df[col] = fund_flow_df[col].apply(convert_unit)
 
             if period == '即时':
-                # 临时workaround: akshare超大单API存在bug (列数不匹配)
-                # 使用即时数据的"净额"字段（应该是主力资金净额）
-                print("[提示] 使用主力资金净额（即时数据中的'净额'字段）")
+                # 直接使用即时数据的"净额"字段计算增仓占比
+                # 根据接口文档，即时数据包含: 序号、股票代码、股票简称、最新价、涨跌幅、换手率、流入资金、流出资金、净额、成交额
                 if '净额' in fund_flow_df.columns:
+                    # 将净额字段映射为主力净额（保持向后兼容）
                     fund_flow_df['主力净额'] = fund_flow_df['净额']
+                    print(f"[提示] 使用即时数据的净额字段计算增仓占比")
                 else:
                     print("[ERROR] 未找到'净额'字段")
                     return pd.DataFrame()
 
-                # 计算增仓占比: 增仓占比 = 主力净额 / 成交额 * 100
+                # 计算增仓占比: 增仓占比 = 净额 / 成交额 * 100
                 if '成交额' in fund_flow_df.columns and '主力净额' in fund_flow_df.columns:
-                    fund_flow_df['增仓占比'] = (fund_flow_df['主力净额'] / fund_flow_df['成交额']) * 100
+                    fund_flow_df['增仓占比'] = (fund_flow_df['主力净额'] / fund_flow_df['成交额'].replace(0, np.nan)) * 100
                 
                 # 计算并添加 '流通市值'
                 # 流通市值 = 成交额 / (换手率 / 100)
