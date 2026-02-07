@@ -41,3 +41,6 @@ analysis_results/
 stock_data_cache/
 last_save_time.csv
 *.log
+
+# Claude Code
+.claude/

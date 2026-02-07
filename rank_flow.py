@@ -351,6 +351,63 @@ def calculate_position_increase_score(position_ratio):
         # 负增仓（资金流出），严格扣分
         return max(0, 10 + ratio * 3)  # 每-1%扣3分
 
+def classify_turnover_level(row):
+    """
+    基于成交额和换手率判断放量等级（无需历史数据）
+
+    逻辑：
+    - 成交额大 + 换手率高 = 明显放量
+    - 成交额适中 + 换手率高 = 温和放量
+    - 成交额大 + 换手率低 = 大盘股正常
+    - 成交额小 + 换手率低 = 缩量
+    """
+    turnover_amount = row.get('成交额', 0)
+    turnover_rate = row.get('换手率', 0)
+
+    # 处理换手率字符串格式
+    if isinstance(turnover_rate, str):
+        turnover_rate = float(turnover_rate.replace('%', ''))
+
+    if pd.isna(turnover_amount) or pd.isna(turnover_rate):
+        return "数据缺失"
+
+    turnover_amount = float(turnover_amount)
+    turnover_rate = float(turnover_rate)
+
+    # 判断逻辑
+    if turnover_amount >= 10_0000_0000:  # >= 10亿
+        if turnover_rate >= 10:
+            return "强放量"
+        elif turnover_rate >= 5:
+            return "明显放量"
+        elif turnover_rate >= 3:
+            return "温和放量"
+        else:
+            return "正常"
+    elif turnover_amount >= 5_0000_0000:  # >= 5亿
+        if turnover_rate >= 15:
+            return "强放量"
+        elif turnover_rate >= 8:
+            return "明显放量"
+        elif turnover_rate >= 5:
+            return "温和放量"
+        else:
+            return "正常"
+    elif turnover_amount >= 2_0000_0000:  # >= 2亿
+        if turnover_rate >= 20:
+            return "明显放量"
+        elif turnover_rate >= 10:
+            return "温和放量"
+        else:
+            return "正常"
+    else:  # < 2亿
+        if turnover_rate >= 15:
+            return "温和放量"
+        elif turnover_rate >= 5:
+            return "正常"
+        else:
+            return "缩量"
+
 def calculate_volume_ratio_score(volume_ratio):
     """
     计算量比评分 (0-100分) - 严格标准
@@ -615,6 +672,9 @@ def add_comprehensive_scores(df: pd.DataFrame) -> pd.DataFrame:
     df['活跃度评分'] = df['换手率'].apply(calculate_turnover_rate_score)
     df['流动性评分'] = df['成交额'].apply(calculate_turnover_amount_score)
 
+    # 添加放量等级（基于成交额和换手率）
+    df['放量等级'] = df.apply(classify_turnover_level, axis=1)
+
     # 统计综合评分分布
     score_ranges = [
         ('优秀(≥80分)', len(df[df['综合评分'] >= 80])),
@@ -715,6 +775,9 @@ def rank_fund_flow(fund_flow_df: pd.DataFrame, sort_by: str = 'comprehensive', t
         if sort_by == 'comprehensive':
             # 综合评分排序：显示综合评分及各维度子评分
             result_cols.extend(['综合评分', '增仓占比', '涨跌幅', '换手率', '成交额'])
+            # 添加放量等级（基于成交额和换手率）
+            if '放量等级' in ranked_df.columns:
+                result_cols.append('放量等级')
             # 如果有量比数据，也添加
             if '当日量比' in ranked_df.columns:
                 result_cols.append('当日量比')

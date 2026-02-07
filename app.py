@@ -255,6 +255,9 @@ if selected_page == "🔍 智能选股":
                         column_config={
                             "股票代码": st.column_config.TextColumn("代码"),
                             "增仓占比": st.column_config.NumberColumn("增仓占比", format="%.2f%%"),
+                            "放量等级": st.column_config.TextColumn("放量等级", help="基于成交额和换手率判断的放量程度"),
+                            "换手率": st.column_config.NumberColumn("换手率", format="%.2f%%"),
+                            "涨跌幅": st.column_config.NumberColumn("涨跌幅", format="%.2f%%"),
                         }
                     )
                 else:
@@ -302,6 +305,7 @@ elif selected_page == "🤖 AI 预测分析":
                     column_config={
                         "股票代码": st.column_config.TextColumn("代码"),
                         "增仓占比": st.column_config.NumberColumn("增仓占比", format="%.2f%%"),
+                        "放量等级": st.column_config.TextColumn("放量等级", help="基于成交额和换手率判断的放量程度"),
                         "当日量比": st.column_config.NumberColumn("当日量比", format="%.2f", help="今日成交量 / 过去5日均量"),
                         "换手率": st.column_config.NumberColumn("换手率", format="%.2f%%"),
                         "涨跌幅": st.column_config.NumberColumn("涨跌幅", format="%.2f%%"),
