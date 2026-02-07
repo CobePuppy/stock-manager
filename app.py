@@ -209,6 +209,14 @@ if selected_page == "🔍 智能选股":
                             if pd.api.types.is_numeric_dtype(display_df[c]):
                                 display_df[c] = display_df[c].apply(format_money_for_show)
 
+                    # 将百分比字符串列转换为数字（用于正确显示）
+                    percent_cols = ['换手率', '涨跌幅']
+                    for c in percent_cols:
+                        if c in display_df.columns:
+                            # 如果是字符串类型（带%），转换为数字
+                            if display_df[c].dtype == 'object':
+                                display_df[c] = display_df[c].apply(lambda x: float(str(x).replace('%', '')) if pd.notna(x) and '%' in str(x) else x)
+
                     # 快捷操作区 - 查看K线
                     st.markdown("### 🛠️ 快捷操作")
 
@@ -297,7 +305,15 @@ elif selected_page == "🤖 AI 预测分析":
                     if c in display_df.columns:
                         if pd.api.types.is_numeric_dtype(display_df[c]):
                             display_df[c] = display_df[c].apply(format_money_for_show)
-                
+
+                # 将百分比字符串列转换为数字（用于正确显示）
+                percent_cols = ['换手率', '涨跌幅']
+                for c in percent_cols:
+                    if c in display_df.columns:
+                        # 如果是字符串类型（带%），转换为数字
+                        if display_df[c].dtype == 'object':
+                            display_df[c] = display_df[c].apply(lambda x: float(str(x).replace('%', '')) if pd.notna(x) and '%' in str(x) else x)
+
                 st.markdown("### 📋 待分析股票列表")
                 st.dataframe(
                     display_df,
