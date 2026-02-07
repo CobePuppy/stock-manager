@@ -115,6 +115,28 @@ def get_fund_flow_data(period: str = '即时') -> pd.DataFrame:
             # 补全股票代码前导0 (数据库Text类型应该保留了，但防守一下)
             if '股票代码' in df_cache.columns:
                 df_cache['股票代码'] = df_cache['股票代码'].astype(str).apply(lambda x: x.zfill(6))
+
+            # 如果是即时数据且缺少主力净额，尝试补充
+            if period == '即时' and '主力净额' not in df_cache.columns:
+                print("缓存数据缺少主力净额，尝试补充超大单数据...")
+                try:
+                    df_super = ak.stock_fund_flow_individual(symbol='超大单')
+                    if not df_super.empty:
+                        df_super['股票代码'] = df_super['股票代码'].astype(str).str.zfill(6)
+                        df_super = df_super[df_super['股票代码'].str.startswith(('6', '3', '0'))]
+                        if '净额' in df_super.columns:
+                            df_super['净额'] = df_super['净额'].apply(convert_unit)
+                        super_net_map = df_super.set_index('股票代码')['净额'].to_dict()
+                        df_cache['主力净额'] = df_cache['股票代码'].map(super_net_map)
+                        # 重新计算增仓占比
+                        if '成交额' in df_cache.columns:
+                            df_cache['增仓占比'] = (df_cache['主力净额'] / df_cache['成交额']) * 100
+                        print(f"成功补充 {len(df_super)} 只股票的超大单数据")
+                except Exception as e:
+                    print(f"补充超大单数据失败: {e}，使用原有数据")
+                    if '主力净额' not in df_cache.columns:
+                        df_cache['主力净额'] = df_cache['净额'] if '净额' in df_cache.columns else 0
+
             return df_cache
     except Exception as e:
         print(f"数据库读取异常: {e}, 转为API获取")
@@ -139,9 +161,33 @@ def get_fund_flow_data(period: str = '即时') -> pd.DataFrame:
                     fund_flow_df[col] = fund_flow_df[col].apply(convert_unit)
 
             if period == '即时':
-                # 计算增仓占比: 增仓占比 = 净额 / 成交额 * 100
-                if '成交额' in fund_flow_df.columns and '净额' in fund_flow_df.columns:
-                    fund_flow_df['增仓占比'] = (fund_flow_df['净额'] / fund_flow_df['成交额']) * 100
+                # 获取超大单数据用于计算增仓占比（主力资金）
+                try:
+                    print("正在获取超大单数据...")
+                    df_super = ak.stock_fund_flow_individual(symbol='超大单')
+                    if not df_super.empty:
+                        df_super['股票代码'] = df_super['股票代码'].astype(str).str.zfill(6)
+                        df_super = df_super[df_super['股票代码'].str.startswith(('6', '3', '0'))]
+
+                        # 转换净额单位
+                        if '净额' in df_super.columns:
+                            df_super['净额'] = df_super['净额'].apply(convert_unit)
+
+                        # 将超大单净额映射到主数据
+                        super_net_map = df_super.set_index('股票代码')['净额'].to_dict()
+                        fund_flow_df['主力净额'] = fund_flow_df['股票代码'].map(super_net_map)
+
+                        print(f"成功获取 {len(df_super)} 只股票的超大单数据")
+                    else:
+                        fund_flow_df['主力净额'] = fund_flow_df['净额']  # 降级使用所有资金净额
+                        print("超大单数据为空，降级使用所有资金净额")
+                except Exception as e:
+                    print(f"获取超大单数据失败: {e}，降级使用所有资金净额")
+                    fund_flow_df['主力净额'] = fund_flow_df['净额']
+
+                # 计算增仓占比: 增仓占比 = 主力净额 / 成交额 * 100
+                if '成交额' in fund_flow_df.columns and '主力净额' in fund_flow_df.columns:
+                    fund_flow_df['增仓占比'] = (fund_flow_df['主力净额'] / fund_flow_df['成交额']) * 100
                 
                 # 计算并添加 '流通市值'
                 # 流通市值 = 成交额 / (换手率 / 100)

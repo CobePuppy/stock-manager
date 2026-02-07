@@ -162,15 +162,36 @@ if selected_page == "🔍 智能选股":
     trade_date = database.get_stock_trade_date()
     
     st.subheader(f"📅 当前展示: {period} 数据 (数据日期: {trade_date})")
-    
-    refresh = st.button("🔄 刷新数据")
-    
+
+    col_ref1, col_ref2 = st.columns([1, 4])
+    with col_ref1:
+        refresh = st.button("🔄 刷新数据", help="清除缓存并重新从API获取最新数据")
+    with col_ref2:
+        if refresh:
+            st.info("正在清除缓存...")
+
     if period:
         # 获取数据的Loading状态
         with st.spinner('正在分析全市场资金流向...'):
             try:
                 # 尝试获取数据
                 if refresh or f'df_{period}' not in st.session_state:
+                    # 如果点击了刷新按钮，清除数据库缓存
+                    if refresh:
+                        import sqlite3
+                        import os
+                        db_file = 'stock_data.db'
+                        if os.path.exists(db_file):
+                            try:
+                                conn = sqlite3.connect(db_file)
+                                cursor = conn.cursor()
+                                cursor.execute("DELETE FROM fund_flow_cache WHERE period_type = ?", (period,))
+                                conn.commit()
+                                conn.close()
+                                st.success(f"已清除 {period} 缓存，正在重新获取...")
+                            except Exception as e:
+                                st.warning(f"清除缓存失败: {e}")
+
                     df = rf.get_fund_flow_data(period=period)
                     if '日排行' in period and '增仓占比' not in df.columns:
                         df['增仓占比'] = float('nan')
