@@ -493,6 +493,54 @@ def calculate_volume_ratio_local(stock_code):
         # 静默失败，返回NaN
         return np.nan
 
+def add_pe_ratio_for_stocks(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    为股票列表补充市盈率(PE)数据
+
+    使用全市场行情接口批量获取PE数据
+    """
+    if df.empty or '股票代码' not in df.columns:
+        return df
+
+    try:
+        print(f"正在获取市盈率(PE)数据...")
+        # 获取全市场行情数据（包含PE）
+        spot_df = ak.stock_zh_a_spot_em()
+
+        if spot_df.empty:
+            print("警告: 未能获取市场行情数据")
+            return df
+
+        # 查找市盈率相关列
+        pe_col = None
+        for col in spot_df.columns:
+            if '市盈率' in col or col == '市盈率-动态':
+                pe_col = col
+                break
+
+        if pe_col is None:
+            print("警告: 市场行情数据中未找到市盈率列")
+            return df
+
+        # 建立代码到PE的映射
+        spot_df['代码'] = spot_df['代码'].astype(str).str.zfill(6)
+        pe_map = spot_df.set_index('代码')[pe_col].to_dict()
+
+        # 映射到目标DataFrame
+        df['市盈率'] = df['股票代码'].map(pe_map)
+
+        # 统计
+        has_pe = df['市盈率'].notna().sum()
+        print(f"成功获取 {has_pe}/{len(df)} 只股票的市盈率数据")
+
+    except Exception as e:
+        print(f"获取PE数据失败: {e}")
+        # 添加空列避免后续报错
+        if '市盈率' not in df.columns:
+            df['市盈率'] = None
+
+    return df
+
 def add_volume_ratio_for_top_stocks(df: pd.DataFrame) -> pd.DataFrame:
     """
     为筛选后的股票列表计算量比并重新评分
@@ -609,13 +657,15 @@ def rank_fund_flow(fund_flow_df: pd.DataFrame, sort_by: str = 'comprehensive', t
         # 先用4维度评分筛选出Top 500
         temp_top_500 = fund_flow_df_with_scores.sort_values(by='综合评分', ascending=False).head(500)
 
-        print(f"第2步：对Top 500计算量比并重新评分...")
+        print(f"第2步：对Top 500补充量比和PE数据...")
         # 对Top 500计算量比
-        temp_top_500_with_volume = add_volume_ratio_for_top_stocks(temp_top_500.copy())
+        temp_top_500_enhanced = add_volume_ratio_for_top_stocks(temp_top_500.copy())
+        # 对Top 500补充PE数据
+        temp_top_500_enhanced = add_pe_ratio_for_stocks(temp_top_500_enhanced)
 
-        # 合并回原数据（保留量比数据）
+        # 合并回原数据（保留量比和PE数据）
         fund_flow_df_with_scores = fund_flow_df_with_scores.drop(temp_top_500.index)
-        fund_flow_df_with_scores = pd.concat([fund_flow_df_with_scores, temp_top_500_with_volume], ignore_index=False)
+        fund_flow_df_with_scores = pd.concat([fund_flow_df_with_scores, temp_top_500_enhanced], ignore_index=False)
 
         print("[OK] 两步筛选完成！")
 
@@ -655,10 +705,11 @@ def rank_fund_flow(fund_flow_df: pd.DataFrame, sort_by: str = 'comprehensive', t
         ranked_df = working_df.sort_values(by=column_name, ascending=False).head(top_n).copy()
 
         # 2. 构建显示列
+        result_cols = ['股票代码', name_col]
         if '流通市值' in working_df.columns:
-            result_cols = ['股票代码', name_col, '流通市值']
-        else:
-            result_cols = ['股票代码', name_col]
+            result_cols.append('流通市值')
+        if '市盈率' in ranked_df.columns:
+            result_cols.append('市盈率')
 
         # 根据排序方式添加关键指标列
         if sort_by == 'comprehensive':
