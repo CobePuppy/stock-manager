@@ -132,10 +132,13 @@ def get_fund_flow_data(period: str = '即时') -> pd.DataFrame:
                         if '成交额' in df_cache.columns:
                             df_cache['增仓占比'] = (df_cache['主力净额'] / df_cache['成交额']) * 100
                         print(f"成功补充 {len(df_super)} 只股票的超大单数据")
+                    else:
+                        raise Exception("超大单API返回空数据")
                 except Exception as e:
-                    print(f"补充超大单数据失败: {e}，使用原有数据")
-                    if '主力净额' not in df_cache.columns:
-                        df_cache['主力净额'] = df_cache['净额'] if '净额' in df_cache.columns else 0
+                    print(f"[ERROR] 获取超大单数据失败: {e}")
+                    print("❌ 无法获取准确数据，请点击'🔄 刷新数据'按钮重新获取")
+                    # 不使用降级数据，返回空以保证准确性
+                    return pd.DataFrame()
 
             return df_cache
     except Exception as e:
@@ -179,11 +182,12 @@ def get_fund_flow_data(period: str = '即时') -> pd.DataFrame:
 
                         print(f"成功获取 {len(df_super)} 只股票的超大单数据")
                     else:
-                        fund_flow_df['主力净额'] = fund_flow_df['净额']  # 降级使用所有资金净额
-                        print("超大单数据为空，降级使用所有资金净额")
+                        raise Exception("超大单API返回空数据")
                 except Exception as e:
-                    print(f"获取超大单数据失败: {e}，降级使用所有资金净额")
-                    fund_flow_df['主力净额'] = fund_flow_df['净额']
+                    print(f"[ERROR] 获取超大单数据失败: {e}")
+                    print("❌ 无法获取准确的主力资金数据")
+                    # 不使用降级数据，返回空DataFrame保证准确性
+                    return pd.DataFrame()
 
                 # 计算增仓占比: 增仓占比 = 主力净额 / 成交额 * 100
                 if '成交额' in fund_flow_df.columns and '主力净额' in fund_flow_df.columns:
