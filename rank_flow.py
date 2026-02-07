@@ -122,15 +122,25 @@ def get_fund_flow_data(period: str = '即时') -> pd.DataFrame:
                 try:
                     df_super = ak.stock_fund_flow_individual(symbol='超大单')
                     if not df_super.empty:
+                        # 重置索引，避免列数不匹配问题
+                        df_super = df_super.reset_index(drop=True)
                         df_super['股票代码'] = df_super['股票代码'].astype(str).str.zfill(6)
-                        df_super = df_super[df_super['股票代码'].str.startswith(('6', '3', '0'))]
+                        df_super = df_super[df_super['股票代码'].str.startswith(('6', '3', '0'))].copy()
+                        df_super = df_super.reset_index(drop=True)
+
                         if '净额' in df_super.columns:
                             df_super['净额'] = df_super['净额'].apply(convert_unit)
+
+                        # 创建映射字典
                         super_net_map = df_super.set_index('股票代码')['净额'].to_dict()
+
+                        # 映射主力净额到缓存数据
                         df_cache['主力净额'] = df_cache['股票代码'].map(super_net_map)
+
                         # 重新计算增仓占比
-                        if '成交额' in df_cache.columns:
+                        if '成交额' in df_cache.columns and '主力净额' in df_cache.columns:
                             df_cache['增仓占比'] = (df_cache['主力净额'] / df_cache['成交额']) * 100
+
                         print(f"成功补充 {len(df_super)} 只股票的超大单数据")
                     else:
                         raise Exception("超大单API返回空数据")
@@ -169,15 +179,20 @@ def get_fund_flow_data(period: str = '即时') -> pd.DataFrame:
                     print("正在获取超大单数据...")
                     df_super = ak.stock_fund_flow_individual(symbol='超大单')
                     if not df_super.empty:
+                        # 重置索引，避免列数不匹配问题
+                        df_super = df_super.reset_index(drop=True)
                         df_super['股票代码'] = df_super['股票代码'].astype(str).str.zfill(6)
-                        df_super = df_super[df_super['股票代码'].str.startswith(('6', '3', '0'))]
+                        df_super = df_super[df_super['股票代码'].str.startswith(('6', '3', '0'))].copy()
+                        df_super = df_super.reset_index(drop=True)
 
                         # 转换净额单位
                         if '净额' in df_super.columns:
                             df_super['净额'] = df_super['净额'].apply(convert_unit)
 
-                        # 将超大单净额映射到主数据
+                        # 创建映射字典
                         super_net_map = df_super.set_index('股票代码')['净额'].to_dict()
+
+                        # 将超大单净额映射到主数据
                         fund_flow_df['主力净额'] = fund_flow_df['股票代码'].map(super_net_map)
 
                         print(f"成功获取 {len(df_super)} 只股票的超大单数据")
