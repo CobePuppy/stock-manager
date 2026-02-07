@@ -131,9 +131,9 @@ with st.sidebar:
 # --- Page 1: 智能选股 ---
 if selected_page == "🔍 智能选股":
     st.header("🔍 资金流向智能选股")
-    
-    # K线快速查看 - 优化版
-    with st.expander("📈 个股K线快速查看", expanded=False):
+
+    # K线快速查看 - 优化版（默认展开）
+    with st.expander("📈 个股K线快速查看", expanded=True):
         col_k1, col_k2, col_k3 = st.columns([2, 2, 1])
 
         with col_k1:
@@ -182,12 +182,6 @@ if selected_page == "🔍 智能选股":
     # 获取当前时间用于展示数据更新状态
     current_time_str = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
     st.markdown(f"> 🕒 **最后更新时间:** {current_time_str}")
-
-    with st.expander("📊 查看计算公式说明", expanded=False):
-        st.markdown("""
-        - **增仓占比**: `(净流入额 / 总成交额) * 100%`
-        - **当日量比**: `今日成交量 / 过去5日平均每日成交量` (大于1表示放量)
-        """)
     
     col1, col2, col3 = st.columns(3)
     period = None
