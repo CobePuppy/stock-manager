@@ -351,44 +351,85 @@ def calculate_position_increase_score(position_ratio):
         # 负增仓（资金流出），严格扣分
         return max(0, 10 + ratio * 3)  # 每-1%扣3分
 
+def calculate_volume_ratio_score(volume_ratio):
+    """
+    计算量比评分 (0-100分) - 严格标准
+    评估成交量变化，量比越大表示资金关注度越高
+    """
+    if pd.isna(volume_ratio) or volume_ratio <= 0:
+        return 0
+
+    ratio = float(volume_ratio)
+
+    if ratio >= 5:  # 巨量
+        return 100
+    elif ratio >= 3:  # 强放量
+        return 90
+    elif ratio >= 2:  # 明显放量
+        return 80
+    elif ratio >= 1.5:  # 温和放量
+        return 70
+    elif ratio >= 1.2:  # 小幅放量
+        return 60
+    elif ratio >= 0.8:  # 正常
+        return 40
+    else:  # 缩量
+        return 20
+
 def calculate_comprehensive_score(row):
     """
-    计算综合评分 (0-100分) - 新版多维度评分系统
+    计算综合评分 (0-100分) - 多维度评分系统
 
     评分维度和权重:
-    - 增仓占比 50%: 资金流入强度（核心指标）
-    - 涨跌幅   20%: 价格动量（趋势确认）
-    - 换手率   15%: 交易活跃度（市场关注）
-    - 成交额   15%: 流动性保障（避免小票）
+    - 增仓占比 45%: 资金流入强度（核心指标）
+    - 涨跌幅   18%: 价格动量（趋势确认）
+    - 换手率   13.5%: 交易活跃度（市场关注）
+    - 成交额   13.5%: 流动性保障（避免小票）
+    - 量比     10%: 成交量放大（可选，需额外计算）
 
     设计理念:
-    - 增仓强 + 价格涨 + 活跃度高 + 流动性好 = 高分
+    - 增仓强 + 价格涨 + 活跃度高 + 流动性好 + 放量 = 高分
     - 多维度验证，降低单一指标误判风险
-    - 所有数据无需额外计算，速度极快
+    - 量比可选，未计算时自动调整权重
     """
-    # 1. 增仓占比评分（权重50%）
+    # 1. 增仓占比评分
     position_ratio = row.get('增仓占比', 0)
     position_score = calculate_position_increase_score(position_ratio)
 
-    # 2. 涨跌幅评分（权重20%）
+    # 2. 涨跌幅评分
     price_change = row.get('涨跌幅', 0)
     momentum_score = calculate_price_momentum_score(price_change)
 
-    # 3. 换手率评分（权重15%）
+    # 3. 换手率评分
     turnover_rate = row.get('换手率', 0)
     activity_score = calculate_turnover_rate_score(turnover_rate)
 
-    # 4. 成交额评分（权重15%）
+    # 4. 成交额评分
     turnover_amount = row.get('成交额', 0)
     liquidity_score = calculate_turnover_amount_score(turnover_amount)
 
-    # 综合评分 = 加权平均
-    comprehensive = (
-        position_score * 0.50 +
-        momentum_score * 0.20 +
-        activity_score * 0.15 +
-        liquidity_score * 0.15
-    )
+    # 5. 量比评分（可选）
+    volume_ratio = row.get('当日量比', None)
+    has_volume_ratio = pd.notna(volume_ratio) and volume_ratio > 0
+
+    if has_volume_ratio:
+        # 有量比数据：5维度评分
+        volume_score = calculate_volume_ratio_score(volume_ratio)
+        comprehensive = (
+            position_score * 0.45 +
+            momentum_score * 0.18 +
+            activity_score * 0.135 +
+            liquidity_score * 0.135 +
+            volume_score * 0.10
+        )
+    else:
+        # 无量比数据：4维度评分（原权重）
+        comprehensive = (
+            position_score * 0.50 +
+            momentum_score * 0.20 +
+            activity_score * 0.15 +
+            liquidity_score * 0.15
+        )
 
     return round(comprehensive, 1)
 
@@ -452,6 +493,51 @@ def calculate_volume_ratio_local(stock_code):
         # 静默失败，返回NaN
         return np.nan
 
+def add_volume_ratio_for_top_stocks(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    为筛选后的股票列表计算量比并重新评分
+
+    用于两步筛选的第二步：对Top 500计算量比
+    - 逐个计算量比（今日成交量 / 近5日均量）
+    - 添加量比评分
+    - 重新计算5维度综合评分
+    """
+    if df.empty or '股票代码' not in df.columns:
+        return df
+
+    total = len(df)
+    print(f"开始计算{total}只股票的量比...")
+
+    volume_ratios = {}
+    success_count = 0
+
+    for idx, (_, row) in enumerate(df.iterrows()):
+        code = row['股票代码']
+
+        # 显示进度（每50个打印一次）
+        if (idx + 1) % 50 == 0 or (idx + 1) == total:
+            print(f"  进度: {idx + 1}/{total}")
+
+        ratio = calculate_volume_ratio_local(code)
+        if not pd.isna(ratio):
+            success_count += 1
+        volume_ratios[code] = ratio
+
+        # 避免请求过快
+        time.sleep(0.05)
+
+    # 添加量比列
+    df['当日量比'] = df['股票代码'].map(volume_ratios)
+    print(f"成功计算 {success_count}/{total} 只股票的量比")
+
+    # 添加量比评分
+    df['量比评分'] = df['当日量比'].apply(calculate_volume_ratio_score)
+
+    # 重新计算综合评分（现在包含量比）
+    df['综合评分'] = df.apply(calculate_comprehensive_score, axis=1)
+
+    return df
+
 def add_comprehensive_scores(df: pd.DataFrame) -> pd.DataFrame:
     """
     为股票列表添加多维度综合评分（极速版）
@@ -496,21 +582,42 @@ def add_comprehensive_scores(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-def rank_fund_flow(fund_flow_df: pd.DataFrame, sort_by: str = 'comprehensive', top_n: int = 50, period: str = None) -> pd.DataFrame:
+def rank_fund_flow(fund_flow_df: pd.DataFrame, sort_by: str = 'comprehensive', top_n: int = 50, period: str = None, enable_volume_ratio: bool = True) -> pd.DataFrame:
     """
-    对资金流入数据进行排名
+    对资金流入数据进行排名（两步筛选优化）
+
     :param fund_flow_df: 包含资金流入数据的DataFrame
     :param sort_by: 排序指标
-                    'comprehensive'(默认): 综合评分 (增仓+放量)
+                    'comprehensive'(默认): 综合评分 (增仓+涨跌+换手+成交额+量比)
                     'ratio': 增仓占比
                     'net': 净流入(主力)
     :param top_n: 返回前N名
     :param period: 周期名称(如'即时'), 如果提供且为'即时'，则会触发保存Top20到历史数据库
+    :param enable_volume_ratio: 是否启用量比计算（两步筛选）
     :return: 排名后的DataFrame
+
+    两步筛选流程（enable_volume_ratio=True时）:
+    1. 快速评分：计算4维度评分（无量比），筛选Top 500
+    2. 精细评分：对Top 500计算量比，加入5维度评分，输出Top N
     """
-    # 先为所有数据计算多维度综合评分（在过滤和排序之前）
-    # 这样综合评分排序才有意义
+    # 第一步：快速4维度评分（不计算量比）
+    print("第1步：快速4维度评分...")
     fund_flow_df_with_scores = add_comprehensive_scores(fund_flow_df.copy())
+
+    # 如果启用量比且是综合评分排序，执行第二步筛选
+    if enable_volume_ratio and sort_by == 'comprehensive':
+        # 先用4维度评分筛选出Top 500
+        temp_top_500 = fund_flow_df_with_scores.sort_values(by='综合评分', ascending=False).head(500)
+
+        print(f"第2步：对Top 500计算量比并重新评分...")
+        # 对Top 500计算量比
+        temp_top_500_with_volume = add_volume_ratio_for_top_stocks(temp_top_500.copy())
+
+        # 合并回原数据（保留量比数据）
+        fund_flow_df_with_scores = fund_flow_df_with_scores.drop(temp_top_500.index)
+        fund_flow_df_with_scores = pd.concat([fund_flow_df_with_scores, temp_top_500_with_volume], ignore_index=False)
+
+        print("[OK] 两步筛选完成！")
 
     if sort_by == 'comprehensive':
         column_name = '综合评分'
@@ -557,6 +664,9 @@ def rank_fund_flow(fund_flow_df: pd.DataFrame, sort_by: str = 'comprehensive', t
         if sort_by == 'comprehensive':
             # 综合评分排序：显示综合评分及各维度子评分
             result_cols.extend(['综合评分', '增仓占比', '涨跌幅', '换手率', '成交额'])
+            # 如果有量比数据，也添加
+            if '当日量比' in ranked_df.columns:
+                result_cols.append('当日量比')
         else:
             # 其他排序方式：显示主排序列
             result_cols.append(column_name)
@@ -565,7 +675,7 @@ def rank_fund_flow(fund_flow_df: pd.DataFrame, sort_by: str = 'comprehensive', t
                 result_cols.append('净额')
 
         # 3. 添加综合评分及各维度评分列（如果存在且未添加）
-        score_cols = ['综合评分', '增仓评分', '动量评分', '活跃度评分', '流动性评分']
+        score_cols = ['综合评分', '增仓评分', '动量评分', '活跃度评分', '流动性评分', '量比评分']
         for col in score_cols:
             if col in ranked_df.columns and col not in result_cols:
                 result_cols.append(col)
