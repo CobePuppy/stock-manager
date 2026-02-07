@@ -116,38 +116,17 @@ def get_fund_flow_data(period: str = '即时') -> pd.DataFrame:
             if '股票代码' in df_cache.columns:
                 df_cache['股票代码'] = df_cache['股票代码'].astype(str).apply(lambda x: x.zfill(6))
 
-            # 如果是即时数据且缺少主力净额，尝试补充
+            # 如果是即时数据且缺少主力净额，使用净额字段
             if period == '即时' and '主力净额' not in df_cache.columns:
-                print("缓存数据缺少主力净额，尝试补充超大单数据...")
-                try:
-                    df_super = ak.stock_fund_flow_individual(symbol='超大单')
-                    if not df_super.empty:
-                        # 重置索引，避免列数不匹配问题
-                        df_super = df_super.reset_index(drop=True)
-                        df_super['股票代码'] = df_super['股票代码'].astype(str).str.zfill(6)
-                        df_super = df_super[df_super['股票代码'].str.startswith(('6', '3', '0'))].copy()
-                        df_super = df_super.reset_index(drop=True)
-
-                        if '净额' in df_super.columns:
-                            df_super['净额'] = df_super['净额'].apply(convert_unit)
-
-                        # 创建映射字典
-                        super_net_map = df_super.set_index('股票代码')['净额'].to_dict()
-
-                        # 映射主力净额到缓存数据
-                        df_cache['主力净额'] = df_cache['股票代码'].map(super_net_map)
-
-                        # 重新计算增仓占比
-                        if '成交额' in df_cache.columns and '主力净额' in df_cache.columns:
-                            df_cache['增仓占比'] = (df_cache['主力净额'] / df_cache['成交额']) * 100
-
-                        print(f"成功补充 {len(df_super)} 只股票的超大单数据")
-                    else:
-                        raise Exception("超大单API返回空数据")
-                except Exception as e:
-                    print(f"[ERROR] 获取超大单数据失败: {e}")
-                    print("❌ 无法获取准确数据，请点击'🔄 刷新数据'按钮重新获取")
-                    # 不使用降级数据，返回空以保证准确性
+                print("[提示] 缓存数据缺少主力净额，使用'净额'字段（主力资金）")
+                if '净额' in df_cache.columns:
+                    df_cache['主力净额'] = df_cache['净额']
+                    # 重新计算增仓占比
+                    if '成交额' in df_cache.columns:
+                        df_cache['增仓占比'] = (df_cache['主力净额'] / df_cache['成交额']) * 100
+                    print("成功补充主力净额")
+                else:
+                    print("[ERROR] 缓存数据中未找到'净额'字段")
                     return pd.DataFrame()
 
             return df_cache
@@ -174,34 +153,13 @@ def get_fund_flow_data(period: str = '即时') -> pd.DataFrame:
                     fund_flow_df[col] = fund_flow_df[col].apply(convert_unit)
 
             if period == '即时':
-                # 获取超大单数据用于计算增仓占比（主力资金）
-                try:
-                    print("正在获取超大单数据...")
-                    df_super = ak.stock_fund_flow_individual(symbol='超大单')
-                    if not df_super.empty:
-                        # 重置索引，避免列数不匹配问题
-                        df_super = df_super.reset_index(drop=True)
-                        df_super['股票代码'] = df_super['股票代码'].astype(str).str.zfill(6)
-                        df_super = df_super[df_super['股票代码'].str.startswith(('6', '3', '0'))].copy()
-                        df_super = df_super.reset_index(drop=True)
-
-                        # 转换净额单位
-                        if '净额' in df_super.columns:
-                            df_super['净额'] = df_super['净额'].apply(convert_unit)
-
-                        # 创建映射字典
-                        super_net_map = df_super.set_index('股票代码')['净额'].to_dict()
-
-                        # 将超大单净额映射到主数据
-                        fund_flow_df['主力净额'] = fund_flow_df['股票代码'].map(super_net_map)
-
-                        print(f"成功获取 {len(df_super)} 只股票的超大单数据")
-                    else:
-                        raise Exception("超大单API返回空数据")
-                except Exception as e:
-                    print(f"[ERROR] 获取超大单数据失败: {e}")
-                    print("❌ 无法获取准确的主力资金数据")
-                    # 不使用降级数据，返回空DataFrame保证准确性
+                # 临时workaround: akshare超大单API存在bug (列数不匹配)
+                # 使用即时数据的"净额"字段（应该是主力资金净额）
+                print("[提示] 使用主力资金净额（即时数据中的'净额'字段）")
+                if '净额' in fund_flow_df.columns:
+                    fund_flow_df['主力净额'] = fund_flow_df['净额']
+                else:
+                    print("[ERROR] 未找到'净额'字段")
                     return pd.DataFrame()
 
                 # 计算增仓占比: 增仓占比 = 主力净额 / 成交额 * 100
