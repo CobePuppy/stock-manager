@@ -251,8 +251,8 @@ if selected_page == "🔍 智能选股":
                 if df is not None and not df.empty:
                     # 排名计算 - 使用4维度快速评分（禁用量比和PE）
                     sort_by = 'comprehensive' if '增仓占比' in df.columns else 'net'
-                    # 只获取Top3结果，使用数据库缓存数据
-                    ranked_df = rf.rank_fund_flow(df, sort_by=sort_by, top_n=3, period=period, enable_volume_ratio=False)
+                    # 智能选股页面显示Top20，使用数据库缓存数据
+                    ranked_df = rf.rank_fund_flow(df, sort_by=sort_by, top_n=config.TOP_N, period=period, enable_volume_ratio=False)
                     
                     # 格式化展示
                     display_df = ranked_df.copy()
@@ -362,8 +362,8 @@ elif selected_page == "🤖 AI 预测分析":
                 if st.button("获取此页面的即时 Top 数据"):
                      df = get_fund_flow_data_cached(period='即时')
                      if not df.empty:
-                        # 只获取Top3，禁用量比计算
-                        target_df = rf.rank_fund_flow(df, sort_by='comprehensive', top_n=3, period='即时', enable_volume_ratio=False)
+                        # AI预测页面获取Top3进行分析，禁用量比计算
+                        target_df = rf.rank_fund_flow(df, sort_by='comprehensive', top_n=config.PREDICT_TOP_N, period='即时', enable_volume_ratio=False)
                         st.session_state['prediction_target'] = target_df
                         st.rerun()
             
